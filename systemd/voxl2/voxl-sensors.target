@@ -1,0 +1,7 @@
+[Unit]
+Description=VOXL2 ROS 2 sensor publishers
+Wants=voxl-test2.service voxl-mpa-to-ros2.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+[Unit]
+Description=VOXL H.265 hardware decoder for ROS 2
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+Group=nvidia
+WorkingDirectory=/home/nvidia/voxl_h265_decoder_ws
+Environment=HOME=/home/nvidia
+Environment=ROS_DOMAIN_ID=0
+Environment=ROS_LOCALHOST_ONLY=0
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ExecStart=/bin/bash -lc 'source /opt/ros/humble/setup.bash && source /home/nvidia/voxl_h265_decoder_ws/install/setup.bash && exec ros2 run voxl_h265_decoder h265_decoder_node --ros-args -p decoder:=nvv4l2decoder'
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

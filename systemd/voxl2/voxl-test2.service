@@ -1,0 +1,25 @@
+[Unit]
+Description=VOXL2 test2 sensor publisher
+Wants=network-online.target
+Requires=voxl-imu-server.service
+After=network-online.target voxl-imu-server.service
+Before=voxl-mpa-to-ros2.service
+PartOf=voxl-sensors.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/root
+Environment=HOME=/home/root
+Environment=PYTHONUNBUFFERED=1
+Environment=ROS_DOMAIN_ID=0
+Environment=ROS_LOCALHOST_ONLY=0
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ExecStartPre=/bin/bash -c 'until [ -p /run/mpa/imu_apps/request ]; do sleep 0.2; done'
+ExecStartPre=/usr/local/bin/voxl-wait-for-imu
+ExecStart=/bin/bash -lc 'source /opt/ros/foxy/setup.bash && exec /usr/bin/python3 /home/root/test2.py'
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStartSec=90
+TimeoutStopSec=10
