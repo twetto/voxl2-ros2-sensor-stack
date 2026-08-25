@@ -114,16 +114,21 @@ five seconds.
 
 ## OpenVINS calibration
 
-The factory calibration for the `tracking_front` camera on
-`D0014_Starling_2` (VOXL2 hostname `m0054`) is stored at:
+The two VOXL2 modules both identify themselves as `D0014_Starling_2` with
+hostname `m0054`, so their factory calibrations are selected by the rig's
+internal module ID:
 
 ```text
-config/openvins/d0014_tracking_front/kalibr_imucam_chain.yaml
+config/openvins/internal_id_1_tracking_front/kalibr_imucam_chain.yaml
+config/openvins/internal_id_2_tracking_front/kalibr_imucam_chain.yaml
 ```
 
-It uses `/tracking_front/decoded` and the `imu_apps` to `tracking_front`
-factory extrinsic. Point OpenVINS `relative_config_imucam` to this file, or
-copy it beside the estimator configuration as `kalibr_imucam_chain.yaml`.
+Do not interchange these files: their intrinsics and fisheye distortion differ
+substantially even though their reported host and platform identities match.
+Both use `/tracking_front/decoded` and the same factory `imu_apps` to
+`tracking_front` extrinsic. Point OpenVINS `relative_config_imucam` to the
+appropriate file, or copy it beside the estimator configuration as
+`kalibr_imucam_chain.yaml`.
 
 The configured camera-to-IMU time shift is zero because ModalAI's calibration
 does not provide the offset. Measure it for the deployed ROS timestamp and
