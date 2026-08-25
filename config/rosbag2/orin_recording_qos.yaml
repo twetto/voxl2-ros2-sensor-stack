@@ -1,0 +1,11 @@
+/voxl/raw_imu:
+  history: keep_last
+  depth: 1000
+  reliability: best_effort
+  durability: volatile
+
+/tracking_front_misp_encoded:
+  history: keep_last
+  depth: 60
+  reliability: best_effort
+  durability: volatile

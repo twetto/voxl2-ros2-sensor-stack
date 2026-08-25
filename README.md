@@ -112,6 +112,47 @@ ros2 run voxl_h265_decoder h265_decoder_node --ros-args \
 The node reports received, pushed, decoded, published, and dropped totals every
 five seconds.
 
+## OpenVINS calibration
+
+The factory calibration for the `tracking_front` camera on
+`D0014_Starling_2` (VOXL2 hostname `m0054`) is stored at:
+
+```text
+config/openvins/d0014_tracking_front/kalibr_imucam_chain.yaml
+```
+
+It uses `/tracking_front/decoded` and the `imu_apps` to `tracking_front`
+factory extrinsic. Point OpenVINS `relative_config_imucam` to this file, or
+copy it beside the estimator configuration as `kalibr_imucam_chain.yaml`.
+
+The configured camera-to-IMU time shift is zero because ModalAI's calibration
+does not provide the offset. Measure it for the deployed ROS timestamp and
+decoder pipeline before relying on tightly synchronized visual-inertial data.
+
+## Record a sensor bag on Orin
+
+The recorder captures the full-rate source IMU and compact encoded tracking
+camera using explicit best-effort QoS overrides. It intentionally does not
+record `/tracking_front/decoded`, since that much larger stream can be
+reconstructed from the H.265 topic.
+
+From the repository checkout on Orin:
+
+```bash
+chmod +x scripts/orin/record_voxl_bag
+scripts/orin/record_voxl_bag
+```
+
+Bags are named `voxl_YYYYMMDD_HHMMSS` under `~/bags`. To use another base
+directory, pass it as the only argument:
+
+```bash
+scripts/orin/record_voxl_bag /path/to/recordings
+```
+
+Press Ctrl-C once to stop recording and let rosbag2 close the bag cleanly. The
+QoS overrides are in `config/rosbag2/orin_recording_qos.yaml`.
+
 ## Orin automatic startup
 
 The Orin unit runs as user `nvidia`, sources ROS 2 Humble and the decoder

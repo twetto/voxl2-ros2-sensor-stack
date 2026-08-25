@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /opt/ros/humble/setup.bash
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd -- "${script_dir}/../.." && pwd)"
+qos_file="${repo_dir}/config/rosbag2/orin_recording_qos.yaml"
+
+if (( $# > 1 )); then
+  echo "Usage: $0 [output-directory]" >&2
+  exit 2
+fi
+
+output_base="${1:-${HOME}/bags}"
+timestamp="$(date +%Y%m%d_%H%M%S)"
+bag_path="${output_base}/voxl_${timestamp}"
+
+if [[ ! -f "${qos_file}" ]]; then
+  echo "QoS configuration not found: ${qos_file}" >&2
+  exit 1
+fi
+
+mkdir -p -- "${output_base}"
+
+echo "Recording VOXL2 sensors to ${bag_path}"
+echo "QoS overrides: ${qos_file}"
+echo "Press Ctrl-C to finish and close the bag."
+
+exec ros2 bag record \
+  --qos-profile-overrides-path "${qos_file}" \
+  --output "${bag_path}" \
+  /voxl/raw_imu \
+  /tracking_front_misp_encoded
