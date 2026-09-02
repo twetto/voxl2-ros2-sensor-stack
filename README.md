@@ -25,7 +25,9 @@ backend:
 3. Software fallback: `avdec_h265`
 
 The Jetson path uses full-frame Annex-B input, NVDEC, and the VIC converter.
-The other paths negotiate CPU-visible output through `videoconvert`.
+For VIO on Jetson, `output_encoding:=mono8` lets `nvvidconv` produce grayscale
+directly without the additional CPU BGR conversion. The other paths negotiate
+CPU-visible output through `videoconvert`.
 
 ### Dependencies
 
@@ -100,6 +102,22 @@ Default topics:
 - Input: `/tracking_front_misp_encoded` (`sensor_msgs/msg/CompressedImage`)
 - Output: `/tracking_front/decoded` (`sensor_msgs/msg/Image`, `bgr8`)
 
+Output parameters:
+
+- `output_encoding`: `bgr8` (default) or `mono8`
+- `output_reliability`: `reliable` (default) or `best_effort`
+- `output_depth`: publisher history depth (default: `30`)
+
+For a low-overhead local VIO stream on Jetson:
+
+```bash
+ros2 run voxl_h265_decoder h265_decoder_node --ros-args \
+  -p decoder:=nvv4l2decoder \
+  -p output_encoding:=mono8 \
+  -p output_reliability:=best_effort \
+  -p output_depth:=2
+```
+
 Override topics and frame ID with parameters:
 
 ```bash
@@ -161,7 +179,9 @@ QoS overrides are in `config/rosbag2/orin_recording_qos.yaml`.
 ## Orin automatic startup
 
 The Orin unit runs as user `nvidia`, sources ROS 2 Humble and the decoder
-workspace, explicitly selects NVDEC, and restarts after failures.
+workspace, explicitly selects NVDEC, publishes `mono8` with best-effort depth
+2 for low-overhead local VIO, and restarts after failures. The default `bgr8`
+and reliable output remain available for Radeon and visualization use.
 
 Build the workspace first, then install the unit:
 

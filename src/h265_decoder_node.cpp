@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -28,6 +30,17 @@ public:
       "output_topic", "/tracking_front/decoded");
     frame_id_ = declare_parameter<std::string>("frame_id", "tracking_front");
     const auto requested_decoder = declare_parameter<std::string>("decoder", "auto");
+    output_encoding_ = declare_parameter<std::string>("output_encoding", "bgr8");
+    const auto output_reliability = declare_parameter<std::string>(
+      "output_reliability", "reliable");
+    const auto output_depth = declare_parameter<int>("output_depth", 30);
+
+    if (output_encoding_ != "bgr8" && output_encoding_ != "mono8") {
+      throw std::runtime_error("output_encoding must be bgr8 or mono8");
+    }
+    if (output_depth <= 0) {
+      throw std::runtime_error("output_depth must be greater than zero");
+    }
 
     gst_init(nullptr, nullptr);
     const auto element_available = [](const std::string & name) {
@@ -61,8 +74,15 @@ public:
       throw std::runtime_error("Jetson decoder selected but nvvidconv is unavailable");
     }
 
-    auto output_qos = rclcpp::QoS(rclcpp::KeepLast(30));
-    output_qos.reliable().durability_volatile();
+    auto output_qos = rclcpp::QoS(rclcpp::KeepLast(output_depth));
+    if (output_reliability == "reliable") {
+      output_qos.reliable();
+    } else if (output_reliability == "best_effort") {
+      output_qos.best_effort();
+    } else {
+      throw std::runtime_error("output_reliability must be reliable or best_effort");
+    }
+    output_qos.durability_volatile();
     decoded_pub_ = create_publisher<sensor_msgs::msg::Image>(output_topic, output_qos);
 
     const std::string parser_and_decoder = use_jetson_hardware ?
@@ -70,10 +90,15 @@ public:
       "video/x-h265,stream-format=byte-stream,alignment=au ! "
       "nvv4l2decoder enable-full-frame=true enable-max-performance=true ! " :
       "h265parse ! " + decoder + " ! ";
+    const bool output_mono = output_encoding_ == "mono8";
     const std::string output_conversion = use_jetson_hardware ?
-      "nvvidconv ! video/x-raw,format=BGRx ! "
-      "videoconvert ! video/x-raw,format=BGR ! " :
-      "videoconvert ! video/x-raw,format=BGR ! ";
+      (output_mono ?
+        "nvvidconv ! video/x-raw,format=GRAY8 ! " :
+        "nvvidconv ! video/x-raw,format=BGRx ! "
+        "videoconvert ! video/x-raw,format=BGR ! ") :
+      (output_mono ?
+        "videoconvert ! video/x-raw,format=GRAY8 ! " :
+        "videoconvert ! video/x-raw,format=BGR ! ");
     const std::string pipeline_description =
       "appsrc name=source is-live=true format=time do-timestamp=true block=false "
       "caps=video/x-h265,stream-format=byte-stream,alignment=au ! "
@@ -115,9 +140,10 @@ public:
       std::chrono::milliseconds(250), std::bind(&H265DecoderNode::pollBus, this));
 
     RCLCPP_INFO(
-      get_logger(), "%s-decoding %s with %s and publishing %s",
+      get_logger(), "%s-decoding %s with %s and publishing %s as %s (%s, depth %lld)",
       use_hardware ? "Hardware" : "Software",
-      input_topic.c_str(), decoder.c_str(), output_topic.c_str());
+      input_topic.c_str(), decoder.c_str(), output_topic.c_str(), output_encoding_.c_str(),
+      output_reliability.c_str(), static_cast<long long>(output_depth));
   }
 
   ~H265DecoderNode() override
@@ -154,6 +180,9 @@ private:
 
     GstCaps * caps = gst_sample_get_caps(sample);
     GstBuffer * buffer = gst_sample_get_buffer(sample);
+    const GstClockTime pts = buffer != nullptr ? GST_BUFFER_PTS(buffer) : GST_CLOCK_TIME_NONE;
+    int64_t source_stamp_ns = 0;
+    const bool has_source_stamp = takeSourceStamp(pts, source_stamp_ns);
     GstVideoInfo video_info{};
     GstMapInfo map{};
     const bool valid =
@@ -183,8 +212,9 @@ private:
     }
 
     sensor_msgs::msg::Image image;
-    const GstClockTime pts = GST_BUFFER_PTS(buffer);
-    if (GST_CLOCK_TIME_IS_VALID(pts)) {
+    if (has_source_stamp) {
+      image.header.stamp = rclcpp::Time(source_stamp_ns);
+    } else if (GST_CLOCK_TIME_IS_VALID(pts)) {
       if (!output_time_anchored_) {
         output_anchor_ros_ns_ = now().nanoseconds();
         output_anchor_pts_ = pts;
@@ -213,7 +243,7 @@ private:
     image.header.frame_id = frame_id_;
     image.height = height;
     image.width = width;
-    image.encoding = "bgr8";
+    image.encoding = output_encoding_;
     image.is_bigendian = false;
     image.step = stride;
     image.data.resize(expected_size);
@@ -299,6 +329,15 @@ private:
     GST_BUFFER_DTS(buffer) = GST_BUFFER_PTS(buffer);
     GST_BUFFER_DURATION(buffer) = nominal_frame_ns;
 
+    if (stamp_has_seconds) {
+      std::lock_guard<std::mutex> lock(source_stamps_mutex_);
+      source_stamps_[input_pts_ns_] = static_cast<int64_t>(full_stamp_ns);
+      constexpr size_t max_pending_source_stamps = 512;
+      while (source_stamps_.size() > max_pending_source_stamps) {
+        source_stamps_.erase(source_stamps_.begin());
+      }
+    }
+
     const auto status = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buffer);
     if (status != GST_FLOW_OK) {
       RCLCPP_WARN_THROTTLE(
@@ -307,6 +346,22 @@ private:
     } else {
       ++pushed_packet_count_;
     }
+  }
+
+  bool takeSourceStamp(GstClockTime pts, int64_t & stamp_ns)
+  {
+    if (!GST_CLOCK_TIME_IS_VALID(pts)) {
+      return false;
+    }
+
+    std::lock_guard<std::mutex> lock(source_stamps_mutex_);
+    const auto match = source_stamps_.find(pts);
+    if (match == source_stamps_.end()) {
+      return false;
+    }
+    stamp_ns = match->second;
+    source_stamps_.erase(match);
+    return true;
   }
 
   void pollBus()
@@ -346,6 +401,7 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr decoded_pub_;
   rclcpp::TimerBase::SharedPtr bus_timer_;
   std::string frame_id_;
+  std::string output_encoding_;
   bool previous_stamp_has_seconds_{false};
   uint64_t previous_full_stamp_ns_{0};
   uint32_t previous_truncated_stamp_{0};
@@ -360,6 +416,8 @@ private:
   bool output_time_anchored_{false};
   GstClockTime output_anchor_pts_{GST_CLOCK_TIME_NONE};
   int64_t output_anchor_ros_ns_{0};
+  std::mutex source_stamps_mutex_;
+  std::map<GstClockTime, int64_t> source_stamps_;
 };
 
 int main(int argc, char ** argv)
