@@ -14,6 +14,7 @@ BAG_PATH=""
 INTERNAL_ID=""
 PLAYBACK_RATE="1.0"
 CAMERA_IMU_TIMESHIFT="-0.0248"
+DECODER_ELEMENT=""   # auto-detect by default
 
 usage()
 {
@@ -27,6 +28,8 @@ Required:
 Optional:
   --rate RATE          Playback rate (default: 1.0)
   --timeshift SECONDS  OpenVINS camera-to-IMU time shift (default: -0.0264)
+  --decoder ELEMENT    GStreamer H.265 decoder element (default: auto-detect
+                       vah265dec → avdec_h265)
   -h, --help           Show this help
 EOF
 }
@@ -67,6 +70,15 @@ while (( $# > 0 )); do
         exit 2
       fi
       CAMERA_IMU_TIMESHIFT="$2"
+      shift 2
+      ;;
+    --decoder)
+      if (( $# < 2 )); then
+        echo "Missing value for --decoder" >&2
+        usage >&2
+        exit 2
+      fi
+      DECODER_ELEMENT="$2"
       shift 2
       ;;
     -h|--help)
@@ -126,9 +138,6 @@ require_directory()
   fi
 }
 
-require_file /opt/ros/foxy/setup.bash
-require_file "${OPENVINS_WS}/install/setup.bash"
-require_file "${DECODER_WS}/install_foxy/setup.bash"
 require_file "${BASE_CONFIG_DIR}/estimator_config.yaml"
 require_file "${BASE_CONFIG_DIR}/kalibr_imu_chain.yaml"
 require_file "${FACTORY_CONFIG_PATH}"
@@ -136,17 +145,35 @@ require_file "${CLOCK_HELPER}"
 require_directory "${BAG_PATH}"
 require_file "${BAG_PATH}/metadata.yaml"
 
-# Prevent a host Jazzy environment from contaminating the Foxy process.
+# Detect which ROS 2 distro is available (Humble preferred, Foxy fallback).
+if [[ -f /opt/ros/humble/setup.bash ]]; then
+  ROS_SETUP=/opt/ros/humble/setup.bash
+  OPENVINS_INSTALL="${OPENVINS_WS}/install_humble/setup.bash"
+  DECODER_INSTALL="${DECODER_WS}/install_humble/setup.bash"
+elif [[ -f /opt/ros/foxy/setup.bash ]]; then
+  ROS_SETUP=/opt/ros/foxy/setup.bash
+  OPENVINS_INSTALL="${OPENVINS_WS}/install/setup.bash"
+  DECODER_INSTALL="${DECODER_WS}/install_foxy/setup.bash"
+else
+  echo "No supported ROS 2 distro found (need Humble or Foxy under /opt/ros/)" >&2
+  exit 1
+fi
+
+require_file "${ROS_SETUP}"
+require_file "${OPENVINS_INSTALL}"
+require_file "${DECODER_INSTALL}"
+
+# Prevent a host Jazzy/other environment from contaminating the process.
 unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH
 unset ROS_DISTRO ROS_VERSION ROS_PYTHON_VERSION
 unset PYTHONPATH LD_LIBRARY_PATH
 
 # shellcheck disable=SC1091
-source /opt/ros/foxy/setup.bash
+source "${ROS_SETUP}"
 # shellcheck disable=SC1091
-source "${OPENVINS_WS}/install/setup.bash"
+source "${OPENVINS_INSTALL}"
 # shellcheck disable=SC1091
-source "${DECODER_WS}/install_foxy/setup.bash"
+source "${DECODER_INSTALL}"
 
 set -u
 
@@ -246,6 +273,7 @@ echo "Playback rate    : ${PLAYBACK_RATE}x"
 echo "Camera-IMU shift : ${CAMERA_IMU_TIMESHIFT} s"
 echo "Factory camera   : ${FACTORY_CONFIG_PATH}"
 echo "OpenVINS config  : ${CONFIG_PATH}"
+echo "H.265 decoder    : (auto-detect at launch)"
 
 echo "Starting the IMU-anchored simulated clock..."
 setsid python3 "${CLOCK_HELPER}" \
@@ -258,11 +286,14 @@ CHILD_PIDS+=("${CLOCK_PID}")
 sleep 1
 check_child "Simulated clock helper" "${CLOCK_PID}"
 
-echo "Starting the software H.265 decoder..."
+# Default to "auto" — the decoder node itself tries vah265dec → avdec_h265.
+DECODER_ELEMENT="${DECODER_ELEMENT:-auto}"
+
+echo "Starting the H.265 decoder (element: ${DECODER_ELEMENT})..."
 setsid ros2 run voxl_h265_decoder h265_decoder_node \
   --ros-args \
   -p use_sim_time:=true \
-  -p decoder:=avdec_h265 &
+  -p "decoder:=${DECODER_ELEMENT}" &
 DECODER_PID=$!
 CHILD_PIDS+=("${DECODER_PID}")
 
