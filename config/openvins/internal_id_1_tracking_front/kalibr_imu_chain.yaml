@@ -1,0 +1,43 @@
+%YAML:1.0
+
+imu0:
+  T_i_b:
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0, 0.0]
+    - [0.0, 0.0, 1.0, 0.0]
+    - [0.0, 0.0, 0.0, 1.0]
+
+  # Provisional values — NOT from Allan variance.  Replace with proper
+  # ICM42688P calibration once the 2-hr static bag arrives from NFU.
+  # Accel random walk inflated 5× to let the bias tracker keep up with
+  # un-modelled bias drift; gyro random walk inflated 3× similarly.
+  accelerometer_noise_density: 0.00207649074
+  accelerometer_random_walk: 0.00200000000
+  gyroscope_noise_density: 0.00020544166
+  gyroscope_random_walk: 0.00003500000
+
+  rostopic: /voxl/raw_imu
+  time_offset: 0.0
+  update_rate: 1000.0
+  model: "kalibr"
+
+  Tw:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  R_IMUtoGYRO:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  Ta:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  R_IMUtoACC:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  Tg:
+    - [0.0, 0.0, 0.0]
+    - [0.0, 0.0, 0.0]
+    - [0.0, 0.0, 0.0]

@@ -9,6 +9,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
@@ -41,6 +42,18 @@ public:
     if (output_depth <= 0) {
       throw std::runtime_error("output_depth must be greater than zero");
     }
+
+    // Fallback VPS/SPS/PPS for bags recorded after the encoder's initial
+    // parameter packets were already consumed by another subscriber.  The
+    // default is the VOXL2 tracking-front encoder's current configuration.
+    // Update this hex string if you change encoder resolution, tile layout,
+    // profile, or bit depth — pure bitrate changes do not affect it.
+    const auto fallback_hex = declare_parameter<std::string>(
+      "fallback_codec_params",
+      "0000000140010c01ffff016000000300b00000030000030096ac09"
+      "00000001420101016000000300b00000030000030096a002808032165aee4c92ea5005da1425"
+      "000000014401c0e30f09418f610800");
+    fallback_codec_params_ = hexToBytes(fallback_hex);
 
     gst_init(nullptr, nullptr);
     const auto element_available = [](const std::string & name) {
@@ -166,6 +179,34 @@ public:
   }
 
 private:
+  /// Check whether an Annex B byte-stream buffer contains at least one
+  /// VPS (32), SPS (33), or PPS (34) NAL unit.
+  static bool dataContainsParamSets(const uint8_t * data, size_t size)
+  {
+    for (size_t i = 0; i + 4 < size; ++i) {
+      if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
+        const uint8_t nal_type = (data[i + 4] >> 1) & 0x3F;
+        if (nal_type >= 32 && nal_type <= 34) {
+          return true;
+        }
+        i += 3;  // skip past the start code
+      }
+    }
+    return false;
+  }
+
+  /// Decode a hex string (e.g. "0000000140...") to a byte vector.
+  static std::vector<uint8_t> hexToBytes(const std::string & hex)
+  {
+    std::vector<uint8_t> bytes;
+    bytes.reserve(hex.size() / 2);
+    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+      bytes.push_back(static_cast<uint8_t>(
+        std::stoul(hex.substr(i, 2), nullptr, 16)));
+    }
+    return bytes;
+  }
+
   static GstFlowReturn newSampleCallback(GstAppSink * sink, gpointer user_data)
   {
     return static_cast<H265DecoderNode *>(user_data)->publishSample(sink);
@@ -280,6 +321,35 @@ private:
       static_cast<uint64_t>(msg->header.stamp.sec) * GST_SECOND +
       msg->header.stamp.nanosec : 0;
     const uint32_t truncated_stamp = msg->header.stamp.nanosec;
+
+    // If the first packet is missing VPS/SPS/PPS (bag recorded after another
+    // subscriber consumed the encoder's initial parameter packets), inject
+    // the fallback codec parameters as a synthetic bootstrap before
+    // processing the current packet normally.
+    if (source_packet_count_ == 0 && !fallback_codec_params_.empty() &&
+        !dataContainsParamSets(msg->data.data(), msg->data.size())) {
+      GstBuffer * param_buf = gst_buffer_new_allocate(
+        nullptr, fallback_codec_params_.size(), nullptr);
+      if (param_buf != nullptr) {
+        gst_buffer_fill(param_buf, 0, fallback_codec_params_.data(),
+          fallback_codec_params_.size());
+        GST_BUFFER_PTS(param_buf) = 0;
+        GST_BUFFER_DTS(param_buf) = 0;
+        GST_BUFFER_DURATION(param_buf) = 0;
+        const auto status = gst_app_src_push_buffer(
+          GST_APP_SRC(appsrc_), param_buf);
+        if (status == GST_FLOW_OK) {
+          ++pushed_packet_count_;
+        }
+        ++source_packet_count_;
+        input_pts_ns_ = 0;
+        RCLCPP_WARN(get_logger(),
+          "Stream missing VPS/SPS/PPS — injected %zu-byte fallback codec parameters",
+          fallback_codec_params_.size());
+      }
+      // Fall through: source_packet_count_ is now 1, so this packet
+      // enters the re-anchor branch below.
+    }
 
     if (source_packet_count_ == 0) {
       // The first VOXL2 packet is a codec bootstrap packet. Give it PTS zero;
@@ -402,6 +472,7 @@ private:
   rclcpp::TimerBase::SharedPtr bus_timer_;
   std::string frame_id_;
   std::string output_encoding_;
+  std::vector<uint8_t> fallback_codec_params_;
   bool previous_stamp_has_seconds_{false};
   uint64_t previous_full_stamp_ns_{0};
   uint32_t previous_truncated_stamp_{0};
