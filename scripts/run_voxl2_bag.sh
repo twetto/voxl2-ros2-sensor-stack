@@ -7,7 +7,6 @@ OPENVINS_WS="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 DECODER_WS="/home/twetto/voxl_h265_decoder_ws"
 SENSOR_STACK_REPO="${DECODER_WS}/src/voxl_h265_decoder"
 BASE_CONFIG_DIR="${SCRIPT_DIR}/config/voxl2_tracking_front"
-CLOCK_HELPER="${SCRIPT_DIR}/scripts/imu_anchored_clock.py"
 VOXL_BAG_DOMAIN_ID=42
 
 BAG_PATH=""
@@ -141,7 +140,6 @@ require_directory()
 require_file "${BASE_CONFIG_DIR}/estimator_config.yaml"
 require_file "${BASE_CONFIG_DIR}/kalibr_imu_chain.yaml"
 require_file "${FACTORY_CONFIG_PATH}"
-require_file "${CLOCK_HELPER}"
 require_directory "${BAG_PATH}"
 require_file "${BAG_PATH}/metadata.yaml"
 
@@ -275,17 +273,6 @@ echo "Factory camera   : ${FACTORY_CONFIG_PATH}"
 echo "OpenVINS config  : ${CONFIG_PATH}"
 echo "H.265 decoder    : (auto-detect at launch)"
 
-echo "Starting the IMU-anchored simulated clock..."
-setsid python3 "${CLOCK_HELPER}" \
-  --imu-topic /voxl/raw_imu \
-  --rate "${PLAYBACK_RATE}" \
-  --publish-rate 200.0 &
-CLOCK_PID=$!
-CHILD_PIDS+=("${CLOCK_PID}")
-
-sleep 1
-check_child "Simulated clock helper" "${CLOCK_PID}"
-
 # Default to "auto" — the decoder node itself tries vah265dec → avdec_h265.
 DECODER_ELEMENT="${DECODER_ELEMENT:-auto}"
 
@@ -319,4 +306,5 @@ check_child "OpenVINS" "${OPENVINS_PID}"
 
 echo "Playing the bag. Press Ctrl-C to stop."
 ros2 bag play "${BAG_PATH}" \
-  --rate "${PLAYBACK_RATE}"
+  --rate "${PLAYBACK_RATE}" \
+  --clock 5
