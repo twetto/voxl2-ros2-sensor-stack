@@ -1,0 +1,117 @@
+# VOXL2 Internal ID 2 — Calibration Reference
+#
+# Camera: OV9282 tracking camera, 1280 × 800
+#   Model: pinhole + equidistant (Kannala-Brandt)
+#   distortion: theta_d = theta + k1*theta^3 + k2*theta^5 + k3*theta^7 + k4*theta^9
+#   projection: u = fx * theta_d * (mx / r) + cx,  v = fy * theta_d * (my / r) + cy
+#
+# IMU: ICM-42688-P (on-board)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INTRINSICS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Factory calibration (from ModalAI QVIO on-device) ────────────────────────
+# Source: voxl-camera-server factory calibration, read from the unit.
+# NOTE: focal length is ~10% lower than Kalibr and unit 1 factory values.
+# Possible cause: different distortion model basis or transcription error.
+factory:
+  intrinsics: [424.46783066878612, 424.36040801051797, 647.27898503882227, 400.75596714081621]
+  distortion_coefficients: [0.08800108536051284, 0.047679756661108984, -0.06120514615852313, 0.026033788032072815]
+
+# ── Kalibr intrinsic calibration (2026-09-07, bag voxl_20260907_162901) ──────
+# Method: kalibr_calibrate_cameras, pinhole-equi model.
+# Target: 6×6 AprilGrid (tag36h11), tagSize=0.087376 m, tagSpacing=0.301357.
+# Bag: voxl_20260907_162901 (IMU+camera calibration bag), 147 images processed,
+#      38 used, outliers filtered.
+# Reprojection error: [-0.000, -0.000] ± [0.462, 0.437] px.
+# Note: supersedes earlier kalibr_20260907_121803 run which had poor edge coverage.
+kalibr_20260907:
+  intrinsics: [467.21636648663133, 465.5855505350616, 650.1470820776115, 401.10056952631885]
+  distortion_coefficients: [0.0724057032727899, -0.008974195130143298, 0.01653481221998721, -0.007403590108297363]
+  reprojection_error_std: [0.462031, 0.436963]
+  intrinsics_std: [0.74542171, 0.70873903, 0.47366824, 0.46641597]
+  distortion_std: [0.00389056, 0.01004155, 0.01037213, 0.00362481]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXTRINSICS  (Camera ↔ IMU)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Factory T_bs (body → sensor, from ModalAI QVIO) ─────────────────────────
+# "body" frame is NOT the IMU frame — axes are permuted:
+#   body_X = imu_Y,  body_Y = imu_Z,  body_Z = imu_X
+# Translation: camera is ~37 mm ahead of body origin along optical axis.
+factory_extrinsics:
+  T_bs: [0.0, 0.0, 1.0, 0.037,
+         1.0, 0.0, 0.0, 0.0,
+         0.0, 1.0, 0.0, 0.0006,
+         0.0, 0.0, 0.0, 1.0]
+
+# ── Kalibr camera-IMU extrinsics (2026-09-07) ───────────────────────────────
+# Method: kalibr_calibrate_imu_camera, using Kalibr intrinsics above.
+# Bag: voxl_20260907_162901, 147 camera frames, 150891 IMU messages (1000 Hz).
+# IMU: ICM-42688-P, Allan variance noise params (gyr_N=1.663e-4, acc_N=4.622e-4).
+# Post-optimization residuals:
+#   Reprojection: 0.887 ± 0.576 px
+#   Gyroscope:    0.0032 ± 0.0025 rad/s
+#   Accelerometer: 0.048 ± 0.064 m/s²
+# Time offset: t_imu = t_cam + 0.00428 s
+#
+# T_ci: IMU → Camera (equivalent to T_bs with body = IMU frame).
+# Rotation: cam_X ≈ imu_Y, cam_Y ≈ imu_Z, cam_Z ≈ imu_X (with ~1.5° tilt).
+# Translation: camera ~38 mm forward of IMU along optical axis — agrees with factory.
+kalibr_extrinsics_20260907:
+  T_ci: [ 0.0001261,   0.99993995, -0.01095813,  0.00041167,
+         -0.02546228,  0.01095779,  0.99961573,  0.01577146,
+          0.99967578,  0.00015296,  0.02546213, -0.03791555,
+          0.0,         0.0,         0.0,         1.0]
+  T_ic: [ 0.0001261,  -0.02546228,  0.99967578,  0.03830478,
+          0.99993995,  0.01095779,  0.00015296, -0.00057866,
+         -0.01095813,  0.99961573,  0.02546213, -0.01479548,
+          0.0,         0.0,         0.0,         1.0]
+  timeshift_cam_imu: 0.0042822815561731065  # t_imu = t_cam + shift [s]
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMU INTRINSICS  (ICM-42688-P)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Allan variance analysis (2026-09-06) ─────────────────────────────────────
+# Source: 2.13 h static bag on bench floor (rosbag2_2026_09_06-19_15_45).
+# 7.73M samples at ~1008 Hz. Overlapping Allan variance method.
+# Script: scratchpad/imu_intrinsics.py
+#
+# All values are per-axis [x, y, z] in the IMU frame.
+imu_allan_20260906:
+  sample_rate_hz: 1007.7
+  duration_s: 7671.7
+
+  gyroscope:
+    # White noise density (angle random walk) [rad/s/√Hz]
+    noise_density: [1.6633e-04, 1.4329e-04, 4.9645e-05]
+    noise_density_mean: 1.1975e-04
+    # Bias instability [rad/s]
+    bias_instability: [8.8882e-05, 6.7578e-05, 4.1471e-05]
+    # Rate random walk [rad/s²/√Hz]
+    random_walk: [2.3990e-05, 2.1185e-05, 1.4566e-05]
+    random_walk_mean: 1.9914e-05
+    # Static bias (mean of static data) [rad/s]
+    bias: [0.00824226, 0.00062482, 0.00502544]
+
+  accelerometer:
+    # White noise density (velocity random walk) [m/s²/√Hz]
+    noise_density: [2.6493e-04, 2.0002e-04, 4.1551e-04]
+    noise_density_mean: 2.9349e-04
+    # Bias instability [m/s²]
+    bias_instability: [2.5312e-04, 2.6764e-04, 2.3826e-03]
+    # Acceleration random walk [m/s³/√Hz]
+    random_walk: [6.4421e-05, 3.1854e-05, 1.1017e-03]
+    random_walk_mean: 3.9950e-04
+    # Static bias (gravity-subtracted) [m/s²]
+    bias: [0.00245438, -0.00106145, 0.05871822]
+
+  # Values used in EqVIO and Kalibr (axis-averaged):
+  #   gyr_N  = 1.663e-4  [rad/s/√Hz]   (max axis, conservative)
+  #   gyr_RRW = 2.399e-5  [rad/s²/√Hz]  (max axis)
+  #   acc_N  = 4.622e-4  [m/s²/√Hz]     (from Allan VRW, max axis ~7.9e-3 is Z-outlier;
+  #                                       using factory-like 4.622e-4 from XY average)
+  #   acc_RRW = 6.442e-5  [m/s³/√Hz]    (XY average; Z=1.1e-3 is outlier)
