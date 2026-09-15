@@ -3,6 +3,13 @@
 
 Usage:
     python imu_intrinsics.py <bag_dir> [--topic /voxl/raw_imu] [--save allan.npz]
+                             [--accel-axes xyz] [--psd-band LO HI]
+
+Each noise term is fitted only where the Allan deviation has that term's
+slope: white noise on the first -1/2 stretch, random walk on a +1/2 stretch.
+White noise is cross-checked against the PSD floor, which also stands in when
+the curve has no -1/2 stretch. With no +1/2 stretch the random walk is not
+observable, and the largest value the curve allows is reported as a bound.
 
 Outputs per-axis and aggregate noise parameters in SI units (rad, m, s)
 suitable for EqVIO (velocityNoise) and OpenVINS (kalibr_imu_chain.yaml).
@@ -16,7 +23,19 @@ from pathlib import Path
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
 
-GRAVITY = 9.80665  # m/s²
+GRAVITY = 9.80665     # m/s²
+BI_SCALE = 0.6643     # Allan floor of flicker noise = 0.6643 × bias instability
+SLOPE_TOL = 0.1       # max |local slope − ideal slope| inside a fit stretch
+MIN_SPAN = 0.3        # a fit stretch covers at least this many decades of τ
+MIN_POINTS = 5        # ... and at least this many τ values
+MIN_CLUSTERS = 10     # σ(τ) is trusted up to τ = duration / MIN_CLUSTERS
+PSD_DISAGREE = 0.3    # flag Allan and PSD white noise differing by more
+AXES = "xyz"
+GYRO_UNITS = ("rad/s/√Hz", "rad/s", "rad/s²/√Hz")
+ACCEL_UNITS = ("m/s²/√Hz", "m/s²", "m/s³/√Hz")
+SAVE_KEYS = {"N": "noise_density", "N_allan": "noise_density_allan",
+             "N_psd": "noise_density_psd", "B": "bias_instability",
+             "K": "random_walk"}
 
 
 def allan_variance(rate_data, dt, n_points=200):
@@ -45,6 +64,134 @@ def allan_variance(rate_data, dt, n_points=200):
     return taus, adevs
 
 
+def local_slope(taus, adevs, half_width=0.1):
+    """Least-squares d log σ / d log τ over ±half_width decades of each τ."""
+    x, y = np.log10(taus), np.log10(adevs)
+    i = np.arange(len(x))
+    lo = np.minimum(np.searchsorted(x, x - half_width), np.maximum(i - 1, 0))
+    hi = np.maximum(np.searchsorted(x, x + half_width, side="right"),
+                    np.minimum(i + 2, len(x)))
+    n = hi - lo
+
+    def window_sum(v):
+        cs = np.concatenate([[0.0], np.cumsum(v)])
+        return cs[hi] - cs[lo]
+
+    sx, sy, sxx, sxy = (window_sum(v) for v in (x, y, x * x, x * y))
+    return (n * sxy - sx * sy) / (n * sxx - sx * sx)
+
+
+def runs(mask):
+    """[start, stop) index pairs of the True stretches of a boolean array."""
+    edges = np.flatnonzero(np.diff(np.concatenate(
+        [[0], mask.astype(np.int8), [0]])))
+    return list(zip(edges[::2], edges[1::2]))
+
+
+def long_enough(taus, start, stop):
+    return (stop - start >= MIN_POINTS
+            and np.log10(taus[stop - 1] / taus[start]) >= MIN_SPAN)
+
+
+def psd_floor(rate_data, fs, band):
+    """White-noise density sqrt(S/2) from the median one-sided PSD S in band.
+
+    Welch estimate, ~16 s Hann segments, 50% overlap. The median ignores
+    narrow vibration lines; the band has to sit above the flicker rise and
+    below any on-chip low-pass roll-off.
+    """
+    x = rate_data - np.mean(rate_data)
+    nper = min(1 << int(round(np.log2(16 * fs))), len(x))
+    step = nper // 2
+    win = np.hanning(nper)
+    nseg = (len(x) - nper) // step + 1
+    power = np.zeros(nper // 2 + 1)
+    for k in range(nseg):
+        seg = x[k * step:k * step + nper]
+        power += np.abs(np.fft.rfft((seg - seg.mean()) * win)) ** 2
+    psd = 2.0 * power / (nseg * fs * np.sum(win ** 2))
+    f = np.fft.rfftfreq(nper, 1.0 / fs)
+    sel = (f >= band[0]) & (f <= band[1])
+    return float(np.sqrt(np.median(psd[sel]) / 2.0))
+
+
+def analyse_axis(rate_data, dt, psd_band):
+    """Allan curve and noise terms of one axis of static rate data.
+
+    Returns a dict; 'notes' lists what the curve could not resolve.
+    """
+    taus, adevs = allan_variance(rate_data, dt)
+    slopes = local_slope(taus, adevs)
+    tau_trust = len(rate_data) * dt / MIN_CLUSTERS
+    notes = []
+
+    # White noise dominates the short-τ end, so only the first -1/2 stretch
+    # is white noise; later ones belong to other processes.
+    first = runs(np.abs(slopes + 0.5) <= SLOPE_TOL)[:1]
+    white = first[0] if first and long_enough(taus, *first[0]) else None
+    n_psd = psd_floor(rate_data, 1.0 / dt, psd_band)
+    if white:
+        a, b = white
+        n_allan = 10 ** np.mean(np.log10(adevs[a:b])
+                                + 0.5 * np.log10(taus[a:b]))
+        if abs(n_psd / n_allan - 1) > PSD_DISAGREE:
+            notes.append(f"PSD floor is {n_psd / n_allan - 1:+.0%} off the "
+                         f"Allan fit")
+    else:
+        n_allan = np.nan
+        notes.append("no -1/2 stretch: white noise taken from the PSD floor")
+
+    imin = int(np.argmin(adevs))
+    B = adevs[imin] / BI_SCALE
+    if taus[imin] > tau_trust:
+        notes.append("no bias-instability floor resolved: B is an upper bound")
+
+    rising = (np.abs(slopes - 0.5) <= SLOPE_TOL) & (taus > taus[imin])
+    fits = [r for r in runs(rising) if long_enough(taus, *r)]
+    if fits:
+        a, b = max(fits, key=lambda r: taus[r[1] - 1] / taus[r[0]])
+        K = np.sqrt(3) * 10 ** np.mean(np.log10(adevs[a:b])
+                                       - 0.5 * np.log10(taus[a:b]))
+        k_range = (taus[a], taus[b - 1])
+    else:
+        # Every noise term only adds to σ(τ), so σ(τ) ≥ K·√(τ/3) caps K.
+        cap = taus <= tau_trust
+        K = np.min(np.sqrt(3) * adevs[cap] / np.sqrt(taus[cap]))
+        k_range = None
+        notes.append(f"no +1/2 stretch: random walk not observable, bound "
+                     f"from tau <= {tau_trust:.0f} s")
+
+    return dict(taus=taus, adevs=adevs,
+                N=n_allan if white else n_psd, N_allan=n_allan, N_psd=n_psd,
+                white_range=(taus[white[0]], taus[white[1] - 1])
+                if white else None,
+                B=B, B_tau=taus[imin], K=K, K_range=k_range, notes=notes)
+
+
+def report(name, r, units):
+    n_unit, b_unit, k_unit = units
+    src = ("Allan -1/2 fit {:.3g}-{:.3g} s".format(*r["white_range"])
+           if r["white_range"] else "PSD floor")
+    print(f"  {name}  N  = {r['N']:.3e} {n_unit}   [{src}; "
+          f"PSD floor {r['N_psd']:.3e}]")
+    print(f"          B  = {r['B']:.3e} {b_unit}   "
+          f"[Allan min at tau = {r['B_tau']:.3g} s]")
+    if r["K_range"]:
+        print(f"          K  = {r['K']:.3e} {k_unit}   "
+              "[+1/2 fit {:.3g}-{:.3g} s]".format(*r["K_range"]))
+    else:
+        print(f"          K <= {r['K']:.3e} {k_unit}   [upper bound]")
+    for note in r["notes"]:
+        print(f"          ! {note}")
+
+
+def worst(res, key, axes):
+    """Largest res[axis][key] over axes, and which axis it came from."""
+    i = max(axes, key=lambda a: res[a][key])
+    bound = key == "K" and res[i]["K_range"] is None
+    return res[i][key], AXES[i] + (", upper bound" if bound else "")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract IMU intrinsics from a static ROS2 bag via "
@@ -54,8 +201,16 @@ def main():
     parser.add_argument("--topic", default="/voxl/raw_imu",
                         help="IMU topic name (default: /voxl/raw_imu)")
     parser.add_argument("--save", type=Path, default=None,
-                        help="Save Allan data to .npz file")
+                        help="Save parameters and Allan curves to .npz file")
+    parser.add_argument("--accel-axes", default=AXES,
+                        help="Accel axes the suggested config values are "
+                             "taken over (default: xyz; 'xy' leaves out z)")
+    parser.add_argument("--psd-band", type=float, nargs=2, metavar=("LO", "HI"),
+                        help="PSD band in Hz for the white-noise floor "
+                             "(default: rate/40 to rate/8)")
     args = parser.parse_args()
+    if not args.accel_axes or set(args.accel_axes) - set(AXES):
+        parser.error("--accel-axes takes letters from 'xyz'")
 
     typestore = get_typestore(Stores.ROS2_HUMBLE)
 
@@ -81,14 +236,18 @@ def main():
     accel = np.array(accel)
 
     N = len(stamps)
-    dt = np.mean(np.diff(stamps))
+    dts = np.diff(stamps)
+    dt = np.mean(dts)
     rate = 1.0 / dt
     duration = stamps[-1] - stamps[0]
+    band = tuple(args.psd_band) if args.psd_band else (rate / 40, rate / 8)
 
     print(f"\nSamples: {N:,}")
     print(f"Duration: {duration:.1f}s ({duration/3600:.2f}h)")
     print(f"Mean rate: {rate:.1f} Hz")
     print(f"Mean dt: {dt*1e3:.3f} ms")
+    print(f"Gaps: {np.sum(dts > 1.5 * np.median(dts))} (dt > 1.5x median), "
+          f"non-increasing stamps: {np.sum(dts <= 0)}")
 
     # ── Bias (mean) ──
     gyro_bias = np.mean(gyro, axis=0)
@@ -105,120 +264,77 @@ def main():
     print(f"Accel raw mean:     {accel_bias_raw}")
     print(f"Accel norm:         {accel_norm:.5f} m/s² (expect {GRAVITY:.5f})")
     print(f"Accel bias [m/s²]:  {accel_bias}")
-
-    # ── White noise (std dev) ──
-    gyro_std = np.std(gyro, axis=0)
-    accel_std = np.std(accel, axis=0)
-    gyro_noise_density = gyro_std / np.sqrt(rate)
-    accel_noise_density = accel_std / np.sqrt(rate)
-
-    print(f"\n{'='*60}")
-    print("WHITE NOISE (std dev of static data)")
-    print(f"{'='*60}")
-    print(f"Gyro σ [rad/s]:         {gyro_std}")
-    print(f"Gyro σ [deg/s]:         {np.degrees(gyro_std)}")
-    print(f"Gyro noise density:     {gyro_noise_density}  [rad/s/√Hz]")
-    print(f"Accel σ [m/s²]:         {accel_std}")
-    print(f"Accel noise density:    {accel_noise_density}  [m/s²/√Hz]")
+    if abs(accel_norm / GRAVITY - 1) > 0.01:
+        print("  (norm is >1% off g: one static pose cannot tell a bias "
+              "from a scale-factor error)")
+    print(f"Gyro σ [rad/s]:     {np.std(gyro, axis=0)}")
+    print(f"Accel σ [m/s²]:     {np.std(accel, axis=0)}")
 
     # ── Allan variance ──
     print(f"\n{'='*60}")
     print("ALLAN DEVIATION ANALYSIS")
     print(f"{'='*60}")
-    print(f"Computing (overlapping Allan variance on {N:,} samples)...")
+    print(f"Overlapping Allan variance on {N:,} samples, "
+          f"PSD floor over {band[0]:.3g}-{band[1]:.3g} Hz\n")
 
-    axes = ['x', 'y', 'z']
-    gyro_arw = np.empty(3)      # angle random walk  [rad/s/√Hz]
-    gyro_bi = np.empty(3)       # bias instability   [rad/s]
-    gyro_bi_tau = np.empty(3)
-    gyro_rrw = np.empty(3)      # rate random walk   [rad/s²/√Hz]
-    accel_vrw = np.empty(3)     # velocity random walk [m/s²/√Hz]
-    accel_bi = np.empty(3)      # bias instability   [m/s²]
-    accel_bi_tau = np.empty(3)
-    accel_arw = np.empty(3)     # accel random walk  [m/s³/√Hz]
-
-    for ax in range(3):
-        print(f"  Computing gyro {axes[ax]}...")
-        taus_g, adevs_g = allan_variance(gyro[:, ax], dt)
-        print(f"  Computing accel {axes[ax]}...")
-        taus_a, adevs_a = allan_variance(accel[:, ax], dt)
-
-        # ARW: N = σ_AD(τ) * √τ in the -1/2 slope region (0.5–10s)
-        mask = (taus_g >= 0.5) & (taus_g <= 10.0)
-        if np.any(mask):
-            gyro_arw[ax] = np.median(adevs_g[mask] * np.sqrt(taus_g[mask]))
-        else:
-            idx = np.argmin(np.abs(taus_g - 1.0))
-            gyro_arw[ax] = adevs_g[idx]
-
-        mask = (taus_a >= 0.5) & (taus_a <= 10.0)
-        if np.any(mask):
-            accel_vrw[ax] = np.median(adevs_a[mask] * np.sqrt(taus_a[mask]))
-        else:
-            idx = np.argmin(np.abs(taus_a - 1.0))
-            accel_vrw[ax] = adevs_a[idx]
-
-        # Bias instability: min of Allan deviation / 0.6642
-        imin = np.argmin(adevs_g)
-        gyro_bi[ax] = adevs_g[imin] / 0.6642
-        gyro_bi_tau[ax] = taus_g[imin]
-
-        imin = np.argmin(adevs_a)
-        accel_bi[ax] = adevs_a[imin] / 0.6642
-        accel_bi_tau[ax] = taus_a[imin]
-
-        # Rate random walk: K = σ_AD * √3 / √τ from +1/2 slope tail
-        mask = taus_g > taus_g[np.argmin(adevs_g)] * 3
-        gyro_rrw[ax] = (np.median(adevs_g[mask] * np.sqrt(3)
-                                   / np.sqrt(taus_g[mask]))
-                         if np.any(mask) else 0.0)
-
-        mask = taus_a > taus_a[np.argmin(adevs_a)] * 3
-        accel_arw[ax] = (np.median(adevs_a[mask] * np.sqrt(3)
-                                    / np.sqrt(taus_a[mask]))
-                          if np.any(mask) else 0.0)
-
-        print(f"    Gyro  {axes[ax]}: ARW={gyro_arw[ax]:.4e} rad/s/√Hz  "
-              f"BI={gyro_bi[ax]:.4e} rad/s (τ={gyro_bi_tau[ax]:.1f}s)  "
-              f"RRW={gyro_rrw[ax]:.4e} rad/s²/√Hz")
-        print(f"    Accel {axes[ax]}: VRW={accel_vrw[ax]:.4e} m/s²/√Hz  "
-              f"BI={accel_bi[ax]:.4e} m/s² (τ={accel_bi_tau[ax]:.1f}s)  "
-              f"ARW={accel_arw[ax]:.4e} m/s³/√Hz")
+    gyro_res, accel_res = [], []
+    for label, data, res, units in (("Gyro ", gyro, gyro_res, GYRO_UNITS),
+                                    ("Accel", accel, accel_res, ACCEL_UNITS)):
+        for ax in range(3):
+            res.append(analyse_axis(data[:, ax], dt, band))
+            report(f"{label} {AXES[ax]}", res[-1], units)
 
     # ── Summary ──
     print(f"\n{'='*60}")
     print("SUMMARY  (all units: rad, m, s)")
     print(f"{'='*60}")
 
+    def col(res, key):
+        return np.array([r[key] for r in res])
+
+    def bound_axes(res):
+        axes = [AXES[i] for i, r in enumerate(res) if r["K_range"] is None]
+        return f"  (upper bound: {', '.join(axes)})" if axes else ""
+
     print(f"\nGyroscope:")
-    print(f"  Noise density (white):  {gyro_noise_density}  [rad/s/√Hz]")
-    print(f"  Allan ARW:              {gyro_arw}  [rad/s/√Hz]")
-    print(f"  Bias instability:       {gyro_bi}  [rad/s]")
-    print(f"  Rate random walk:       {gyro_rrw}  [rad/s²/√Hz]")
+    print(f"  Noise density:          {col(gyro_res, 'N')}  [rad/s/√Hz]")
+    print(f"    Allan -1/2 fit:       {col(gyro_res, 'N_allan')}")
+    print(f"    PSD floor:            {col(gyro_res, 'N_psd')}")
+    print(f"  Bias instability:       {col(gyro_res, 'B')}  [rad/s]")
+    print(f"  Rate random walk:       {col(gyro_res, 'K')}  [rad/s²/√Hz]"
+          f"{bound_axes(gyro_res)}")
     print(f"  Bias (mean):            {gyro_bias}  [rad/s]")
 
     print(f"\nAccelerometer:")
-    print(f"  Noise density (white):  {accel_noise_density}  [m/s²/√Hz]")
-    print(f"  Allan VRW:              {accel_vrw}  [m/s²/√Hz]")
-    print(f"  Bias instability:       {accel_bi}  [m/s²]")
-    print(f"  Accel random walk:      {accel_arw}  [m/s³/√Hz]")
+    print(f"  Noise density:          {col(accel_res, 'N')}  [m/s²/√Hz]")
+    print(f"    Allan -1/2 fit:       {col(accel_res, 'N_allan')}")
+    print(f"    PSD floor:            {col(accel_res, 'N_psd')}")
+    print(f"  Bias instability:       {col(accel_res, 'B')}  [m/s²]")
+    print(f"  Accel random walk:      {col(accel_res, 'K')}  [m/s³/√Hz]"
+          f"{bound_axes(accel_res)}")
     print(f"  Bias (mean):            {accel_bias}  [m/s²]")
 
     # ── Config snippets (max across axes) ──
-    gyr = float(np.max(gyro_arw))
-    gyr_bias = float(np.max(gyro_rrw))
-    acc = float(np.max(accel_vrw[:2]))   # exclude z outlier if present
-    acc_bias = float(np.max(accel_arw[:2]))
+    accel_axes = [AXES.index(c) for c in args.accel_axes]
+    gyr, gyr_from = worst(gyro_res, "N", range(3))
+    gyr_bias, gyr_bias_from = worst(gyro_res, "K", range(3))
+    acc, acc_from = worst(accel_res, "N", accel_axes)
+    acc_bias, acc_bias_from = worst(accel_res, "K", accel_axes)
 
     print(f"\n{'='*60}")
-    print("SUGGESTED CONFIG VALUES  (max across axes, z-accel excluded)")
+    print(f"SUGGESTED CONFIG VALUES  (max over gyro xyz, "
+          f"accel {args.accel_axes})")
     print(f"{'='*60}")
 
     print(f"\n  # EqVIO velocityNoise:")
-    print(f"  gyr:     {gyr:.5e}   # gyro white noise  [rad/s/√Hz]")
-    print(f"  gyrBias: {gyr_bias:.5e}   # gyro random walk  [rad/s²/√Hz]")
-    print(f"  acc:     {acc:.5e}   # accel white noise  [m/s²/√Hz]")
-    print(f"  accBias: {acc_bias:.5e}   # accel random walk  [m/s³/√Hz]")
+    print(f"  gyr:     {gyr:.5e}   # gyro white noise  [rad/s/√Hz] "
+          f"({gyr_from})")
+    print(f"  gyrBias: {gyr_bias:.5e}   # gyro random walk  [rad/s²/√Hz] "
+          f"({gyr_bias_from})")
+    print(f"  acc:     {acc:.5e}   # accel white noise  [m/s²/√Hz] "
+          f"({acc_from})")
+    print(f"  accBias: {acc_bias:.5e}   # accel random walk  [m/s³/√Hz] "
+          f"({acc_bias_from})")
 
     print(f"\n  # OpenVINS kalibr_imu_chain.yaml:")
     print(f"  gyroscope_noise_density:     {gyr:.5e}")
@@ -228,17 +344,17 @@ def main():
 
     # ── Save ──
     if args.save:
-        np.savez(
-            args.save,
-            gyro_bias=gyro_bias, accel_bias=accel_bias,
-            gyro_noise_density=gyro_noise_density,
-            accel_noise_density=accel_noise_density,
-            gyro_arw=gyro_arw, gyro_bi=gyro_bi, gyro_rrw=gyro_rrw,
-            accel_vrw=accel_vrw, accel_bi=accel_bi, accel_arw=accel_arw,
-            gyro_std=gyro_std, accel_std=accel_std,
-            rate=rate, duration=duration,
-        )
-        print(f"\nAllan data saved to {args.save}")
+        out = dict(taus=gyro_res[0]["taus"], rate=rate, duration=duration,
+                   gyro_bias=gyro_bias, accel_bias=accel_bias,
+                   accel_mean=accel_bias_raw)
+        for sensor, res in (("gyro", gyro_res), ("accel", accel_res)):
+            out[f"{sensor}_adev"] = col(res, "adevs")
+            for key, name in SAVE_KEYS.items():
+                out[f"{sensor}_{name}"] = col(res, key)
+            out[f"{sensor}_random_walk_is_bound"] = np.array(
+                [r["K_range"] is None for r in res])
+        np.savez(args.save, allow_pickle=False, **out)
+        print(f"\nParameters and Allan curves saved to {args.save}")
 
 
 if __name__ == "__main__":
