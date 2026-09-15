@@ -1,0 +1,5 @@
+# run outputs and the compiled runner stay local
+_work/
+runs/
+*.tum
+openvins/tools/ov_serial

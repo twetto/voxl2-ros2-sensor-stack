@@ -1,0 +1,34 @@
+%YAML:1.0
+
+# Factory calibration for ModalAI D0014_Starling_2 (hostname m0054, internal ID: 2).
+# Intrinsics source: /data/modalai/opencv_tracking_front_intrinsics.yml
+# Extrinsics source: /etc/modalai/extrinsics.conf
+# Factory reprojection error: 0.14909431099139250 px
+cam0:
+  # OpenVINS T_imu_cam stores the camera-to-IMU rotation R_CtoI and
+  # camera position expressed in the IMU frame p_CinI.
+  T_imu_cam:
+    - [0.0, 0.0, 1.0, 0.0370]
+    - [1.0, 0.0, 0.0, 0.0000]
+    - [0.0, 1.0, 0.0, 0.0006]
+    - [0.0, 0.0, 0.0, 1.0000]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs:
+    - 0.08800108536051284
+    - 0.047679756661108984
+    - -0.06120514615852313
+    - 0.026033788032072815
+  distortion_model: equidistant
+  intrinsics:
+    - 424.46783066878612
+    - 424.36040801051797
+    - 647.27898503882227
+    - 400.75596714081621
+  resolution: [1280, 800]
+  rostopic: /tracking_front/decoded
+
+  # OpenVINS uses t_imu = t_cam + timeshift_cam_imu. This value is not part
+  # of the ModalAI factory calibration and must be measured for the deployed
+  # ROS camera-decoding and timestamp pipeline.
+  timeshift_cam_imu: 0.0

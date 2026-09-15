@@ -1,0 +1,50 @@
+%YAML:1.0
+
+imu0:
+  T_i_b:
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0, 0.0]
+    - [0.0, 0.0, 1.0, 0.0]
+    - [0.0, 0.0, 0.0, 1.0]
+
+  # ICM42688P — Allan variance baseline × empirical multipliers.
+  # Baseline from 2.13h static bag (2026-09-06):
+  #   gyr_N=1.663e-4  gyr_RRW=2.399e-5  acc_N=4.622e-4  acc_RRW=6.442e-5
+  # Multipliers: gyr 2×, gyrBias 3×, acc 5×, accBias 20×
+  # These multipliers are NOT principled — they were chosen to land near
+  # previously-working values.  Allan variance measures the static bench
+  # noise floor; real deployment adds vibration, temperature drift, and
+  # timing jitter that the model doesn't capture.  To do this properly:
+  #   1. Allan variance on a prop-on static bag (captures vibration), or
+  #   2. Tune multipliers against filter innovation whiteness, or
+  #   3. Grid-sweep multipliers minimising ATE/RPE vs MOCAP ground truth.
+  accelerometer_noise_density: 2.31095e-03  # 4.622e-4 × 5   [m/s²/√Hz]
+  accelerometer_random_walk:   1.28842e-03  # 6.442e-5 × 20  [m/s³/√Hz]
+  gyroscope_noise_density:     3.32660e-04  # 1.663e-4 × 2   [rad/s/√Hz]
+  gyroscope_random_walk:       7.19700e-05  # 2.399e-5 × 3   [rad/s²/√Hz]
+
+  rostopic: /voxl/raw_imu
+  time_offset: 0.0
+  update_rate: 1000.0
+  model: "kalibr"
+
+  Tw:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  R_IMUtoGYRO:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  Ta:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  R_IMUtoACC:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+  Tg:
+    - [0.0, 0.0, 0.0]
+    - [0.0, 0.0, 0.0]
+    - [0.0, 0.0, 0.0]

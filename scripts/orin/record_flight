@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Record a flight test on the Orin: the VOXL sensors, qvio, mocap and the FC (MAVROS),
+# plus any extra topics given as arguments, e.g. an estimator's output.
+#   scripts/orin/record_flight [extra_topic ...]
+# Writes ${OUTPUT_BASE:-~/bags}/flight_<date>_<time>. MAVROS_NS (default /mocap_drone_01)
+# and MOCAP_TOPIC (default /vrpn_mocap/drone_01/pose) name the FC and mocap topics.
+# Uses the same QoS overrides as record_voxl_bag.
+# before set -u: the ROS setup script reads unset variables
+source /opt/ros/humble/setup.bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(cd -- "${script_dir}/../.." && pwd)"
+qos_file="${repo_dir}/config/rosbag2/orin_recording_qos.yaml"
+ns="${MAVROS_NS:-/mocap_drone_01}"
+output_base="${OUTPUT_BASE:-${HOME}/bags}"
+bag_path="${output_base}/flight_$(date +%Y%m%d_%H%M%S)"
+
+if [[ ! -f "${qos_file}" ]]; then
+  echo "QoS configuration not found: ${qos_file}" >&2
+  exit 1
+fi
+mkdir -p -- "${output_base}"
+echo "Recording flight to ${bag_path}  (Ctrl-C to finish and close the bag)"
+
+exec ros2 bag record \
+  --qos-profile-overrides-path "${qos_file}" \
+  --output "${bag_path}" \
+  /voxl/raw_imu \
+  /tracking_front_misp_encoded \
+  /qvio/odom \
+  "${MOCAP_TOPIC:-/vrpn_mocap/drone_01/pose}" \
+  "${ns}/vision_pose/pose" \
+  "${ns}/imu/data" \
+  "${ns}/local_position/pose" \
+  "${ns}/local_position/velocity_local" \
+  "${ns}/local_position/velocity_body" \
+  "${ns}/rangefinder/rangefinder" \
+  "${ns}/state" \
+  "${ns}/estimator_status" \
+  "${ns}/statustext/recv" \
+  "${ns}/rc/in" \
+  "$@"

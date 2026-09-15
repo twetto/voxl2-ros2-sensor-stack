@@ -261,3 +261,21 @@ ros2 topic hz /tracking_front/decoded
 
 A topic name alone does not prove that VOXL2 is publishing it: the decoder's
 subscription can keep `/tracking_front_misp_encoded` visible in the ROS graph.
+
+## Flight-test tools
+
+Model-independent tools from the 2026-09-14 NFU flight tests. The lessons behind them are in
+[docs/flight_testing.md](docs/flight_testing.md). They run from the source tree (CMake doesn't
+install them) and need Python 3 with numpy and scipy; `h265.py` also needs PyAV and
+`mocap_tools.read_topic` needs `rosbags`, neither needs ROS.
+
+| Path | What |
+|---|---|
+| `scripts/orin/record_flight` | record a flight: VOXL sensors, qvio, mocap and the FC (MAVROS), plus any extra topics |
+| `scripts/orin/orin_ekf.py` | error-state EKF for the Orin: VOXL IMU + a body-frame velocity + rangefinder -> pose for the FC's `vision_pose` (offline so far) |
+| `scripts/orin/test_orin_ekf.py` | the EKF on a simulated flight with known truth |
+| `scripts/orin/imu_buffer.py` | IMU buffer that survives the VOXL clock jumping back after a reboot |
+| `scripts/eval/h265.py` | decode a bag's H.265 camera, including bags recorded mid-stream |
+| `scripts/eval/mocap_tools.py` | VRPN ground truth: duplicate removal, sampling, body rates, VOXL-to-mocap clock alignment |
+| `scripts/eval/traj_eval.py` | SE(3)-aligned trajectory error against mocap |
+| `tools/estimators/` | how OpenVINS and ECHO-LI were run offline on the flight bags |
