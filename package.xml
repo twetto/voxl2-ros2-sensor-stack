@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>voxl_h265_decoder</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>Decode ModalAI H.265 CompressedImage topics into ROS images.</description>
   <maintainer email="twetto@example.com">twetto</maintainer>
   <license>Apache-2.0</license>
@@ -11,8 +11,10 @@
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
 
-  <exec_depend>gstreamer1.0-plugins-bad</exec_depend>
-  <exec_depend>gstreamer1.0-libav</exec_depend>
+  <build_depend>libavcodec-dev</build_depend>
+  <build_depend>libavutil-dev</build_depend>
+  <build_depend>libswscale-dev</build_depend>
+  <exec_depend>ffmpeg</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

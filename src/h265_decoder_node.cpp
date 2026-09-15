@@ -1,20 +1,35 @@
-#include <algorithm>
+/// @file h265_decoder_node.cpp
+/// ROS 2 node that decodes ModalAI VOXL H.265 CompressedImage topics into
+/// raw sensor_msgs/Image using FFmpeg (libavcodec) directly.
+///
+/// Why not GStreamer?  For a single-stream VIO pipeline the appsrc→pipeline→
+/// appsink pattern adds unnecessary latency (inter-element buffering, thread
+/// hand-offs) and memory copies.  Direct libavcodec gives us:
+///   - Synchronous decode in the subscriber callback — zero pipeline latency.
+///   - mono8 output = Y-plane copy only — no videoconvert.
+///   - Hardware decode via hevc_v4l2m2m (Jetson) / hevc_cuvid (NVIDIA) /
+///     generic hevc + VA-API (AMD/Intel) with the same send/receive API.
+///   - FFmpeg naturally produces no output when the reference frame is missing,
+///     so corrupt-GOP handling is built in with no extra logic.
+
 #include <atomic>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
-#include <functional>
-#include <map>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include <gst/app/gstappsink.h>
-#include <gst/app/gstappsrc.h>
-#include <gst/gst.h>
-#include <gst/video/video.h>
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libswscale/swscale.h>
+}
+
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -32,6 +47,7 @@ public:
     frame_id_ = declare_parameter<std::string>("frame_id", "tracking_front");
     const auto requested_decoder = declare_parameter<std::string>("decoder", "auto");
     output_encoding_ = declare_parameter<std::string>("output_encoding", "bgr8");
+    min_frame_sharpness_ = declare_parameter<double>("min_frame_sharpness", 0.0);
     const auto output_reliability = declare_parameter<std::string>(
       "output_reliability", "reliable");
     const auto output_depth = declare_parameter<int>("output_depth", 30);
@@ -42,12 +58,10 @@ public:
     if (output_depth <= 0) {
       throw std::runtime_error("output_depth must be greater than zero");
     }
+    output_mono_ = output_encoding_ == "mono8";
 
     // Fallback VPS/SPS/PPS for bags recorded after the encoder's initial
-    // parameter packets were already consumed by another subscriber.  The
-    // default is the VOXL2 tracking-front encoder's current configuration.
-    // Update this hex string if you change encoder resolution, tile layout,
-    // profile, or bit depth — pure bitrate changes do not affect it.
+    // parameter packets were already consumed by another subscriber.
     const auto fallback_hex = declare_parameter<std::string>(
       "fallback_codec_params",
       "0000000140010c01ffff016000000300b00000030000030096ac09"
@@ -55,38 +69,17 @@ public:
       "000000014401c0e30f09418f610800");
     fallback_codec_params_ = hexToBytes(fallback_hex);
 
-    gst_init(nullptr, nullptr);
-    const auto element_available = [](const std::string & name) {
-        GstElementFactory * factory = gst_element_factory_find(name.c_str());
-        if (factory == nullptr) {
-          return false;
-        }
-        gst_object_unref(factory);
-        return true;
-      };
+    // ---- FFmpeg decoder setup ----
+    openDecoder(requested_decoder);
 
-    std::string decoder = requested_decoder;
-    if (decoder == "auto") {
-      if (element_available("nvv4l2decoder") && element_available("nvvidconv")) {
-        decoder = "nvv4l2decoder";
-      } else if (element_available("vah265dec")) {
-        decoder = "vah265dec";
-      } else if (element_available("avdec_h265")) {
-        decoder = "avdec_h265";
-      } else {
-        throw std::runtime_error(
-                "No supported H.265 decoder found (tried nvv4l2decoder, vah265dec, avdec_h265)");
-      }
-    } else if (!element_available(decoder)) {
-      throw std::runtime_error("Requested GStreamer decoder is unavailable: " + decoder);
+    frame_ = av_frame_alloc();
+    sw_frame_ = av_frame_alloc();
+    pkt_ = av_packet_alloc();
+    if (frame_ == nullptr || sw_frame_ == nullptr || pkt_ == nullptr) {
+      throw std::runtime_error("Failed to allocate AVFrame/AVPacket");
     }
 
-    const bool use_jetson_hardware = decoder == "nvv4l2decoder";
-    const bool use_hardware = use_jetson_hardware || decoder == "vah265dec";
-    if (use_jetson_hardware && !element_available("nvvidconv")) {
-      throw std::runtime_error("Jetson decoder selected but nvvidconv is unavailable");
-    }
-
+    // ---- ROS plumbing ----
     auto output_qos = rclcpp::QoS(rclcpp::KeepLast(output_depth));
     if (output_reliability == "reliable") {
       output_qos.reliable();
@@ -98,208 +91,363 @@ public:
     output_qos.durability_volatile();
     decoded_pub_ = create_publisher<sensor_msgs::msg::Image>(output_topic, output_qos);
 
-    const std::string parser_and_decoder = use_jetson_hardware ?
-      "h265parse config-interval=-1 disable-passthrough=true ! "
-      "video/x-h265,stream-format=byte-stream,alignment=au ! "
-      "nvv4l2decoder enable-full-frame=true enable-max-performance=true ! " :
-      "h265parse ! " + decoder + " ! ";
-    const bool output_mono = output_encoding_ == "mono8";
-    const std::string output_conversion = use_jetson_hardware ?
-      (output_mono ?
-        "nvvidconv ! video/x-raw,format=GRAY8 ! " :
-        "nvvidconv ! video/x-raw,format=BGRx ! "
-        "videoconvert ! video/x-raw,format=BGR ! ") :
-      (output_mono ?
-        "videoconvert ! video/x-raw,format=GRAY8 ! " :
-        "videoconvert ! video/x-raw,format=BGR ! ");
-    const std::string pipeline_description =
-      "appsrc name=source is-live=true format=time do-timestamp=true block=false "
-      "caps=video/x-h265,stream-format=byte-stream,alignment=au ! "
-      + parser_and_decoder + output_conversion +
-      "appsink name=sink emit-signals=true sync=false max-buffers=4 drop=true";
-
-    GError * error = nullptr;
-    pipeline_ = gst_parse_launch(pipeline_description.c_str(), &error);
-    if (error != nullptr) {
-      const std::string message = error->message;
-      g_error_free(error);
-      throw std::runtime_error("Failed to create GStreamer pipeline: " + message);
-    }
-    if (pipeline_ == nullptr) {
-      throw std::runtime_error("GStreamer returned an empty pipeline");
-    }
-
-    appsrc_ = gst_bin_get_by_name(GST_BIN(pipeline_), "source");
-    appsink_ = gst_bin_get_by_name(GST_BIN(pipeline_), "sink");
-    if (appsrc_ == nullptr || appsink_ == nullptr) {
-      throw std::runtime_error("Could not retrieve GStreamer appsrc/appsink");
-    }
-
-    GstAppSinkCallbacks callbacks{};
-    callbacks.new_sample = &H265DecoderNode::newSampleCallback;
-    gst_app_sink_set_callbacks(GST_APP_SINK(appsink_), &callbacks, this, nullptr);
-
-    if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-      throw std::runtime_error("Failed to start GStreamer decoder pipeline");
-    }
-
     auto input_qos = rclcpp::QoS(rclcpp::KeepLast(100));
     input_qos.reliable().durability_volatile();
     encoded_sub_ = create_subscription<sensor_msgs::msg::CompressedImage>(
       input_topic, input_qos,
       std::bind(&H265DecoderNode::encodedCallback, this, std::placeholders::_1));
 
-    bus_timer_ = create_wall_timer(
-      std::chrono::milliseconds(250), std::bind(&H265DecoderNode::pollBus, this));
+    stats_timer_ = create_wall_timer(
+      std::chrono::seconds(5), std::bind(&H265DecoderNode::logStats, this));
 
     RCLCPP_INFO(
-      get_logger(), "%s-decoding %s with %s and publishing %s as %s (%s, depth %lld)",
-      use_hardware ? "Hardware" : "Software",
-      input_topic.c_str(), decoder.c_str(), output_topic.c_str(), output_encoding_.c_str(),
-      output_reliability.c_str(), static_cast<long long>(output_depth));
+      get_logger(),
+      "Decoding %s (%s) → %s as %s (%s, depth %ld)",
+      input_topic.c_str(), decoder_label_.c_str(),
+      output_topic.c_str(), output_encoding_.c_str(),
+      output_reliability.c_str(), output_depth);
   }
 
   ~H265DecoderNode() override
   {
-    if (appsrc_ != nullptr) {
-      gst_app_src_end_of_stream(GST_APP_SRC(appsrc_));
+    if (sws_ctx_ != nullptr) {
+      sws_freeContext(sws_ctx_);
     }
-    if (pipeline_ != nullptr) {
-      gst_element_set_state(pipeline_, GST_STATE_NULL);
+    if (sw_frame_ != nullptr) {
+      av_frame_free(&sw_frame_);
     }
-    if (appsink_ != nullptr) {
-      gst_object_unref(appsink_);
+    if (frame_ != nullptr) {
+      av_frame_free(&frame_);
     }
-    if (appsrc_ != nullptr) {
-      gst_object_unref(appsrc_);
+    if (pkt_ != nullptr) {
+      av_packet_free(&pkt_);
     }
-    if (pipeline_ != nullptr) {
-      gst_object_unref(pipeline_);
+    if (codec_ctx_ != nullptr) {
+      avcodec_free_context(&codec_ctx_);
+    }
+    if (hw_device_ctx_ != nullptr) {
+      av_buffer_unref(&hw_device_ctx_);
     }
   }
 
 private:
-  /// Check whether an Annex B byte-stream buffer contains at least one
-  /// VPS (32), SPS (33), or PPS (34) NAL unit.
-  static bool dataContainsParamSets(const uint8_t * data, size_t size)
+  // ---------------------------------------------------------------------------
+  // Decoder setup
+  // ---------------------------------------------------------------------------
+
+  /// Allocate a codec context with our strict error-handling settings.
+  AVCodecContext * makeContext(const AVCodec * codec)
   {
+    AVCodecContext * ctx = avcodec_alloc_context3(codec);
+    if (ctx == nullptr) {
+      return nullptr;
+    }
+    // Strict error handling: abort on bitstream errors rather than silently
+    // outputting error-concealed garbage (green blocks / stale-reference
+    // frames).  Without this, FFmpeg fills in missing data from whatever
+    // reference it has — the frame looks "decoded" but is visually wrong,
+    // and no flag is set.
+    ctx->err_recognition = AV_EF_CRCCHECK;
+    ctx->error_concealment = 0;
+    return ctx;
+  }
+
+  /// Try to open a named HW decoder that requires a specific device context
+  /// (e.g. hevc_cuvid needs CUDA, hevc_vaapi needs VAAPI).  If the device
+  /// context cannot be created, avcodec_open2 is never called — some FFmpeg
+  /// builds segfault when a HW codec is opened without its device.
+  bool tryOpenHwDecoder(
+    const char * name, AVHWDeviceType device_type,
+    const char * device_path = nullptr)
+  {
+    const AVCodec * codec = avcodec_find_decoder_by_name(name);
+    if (codec == nullptr) {
+      return false;
+    }
+    AVCodecContext * ctx = makeContext(codec);
+    if (ctx == nullptr) {
+      return false;
+    }
+    AVBufferRef * hw_ctx = nullptr;
+    // Try with explicit device path first, then auto-detect.
+    if (device_path != nullptr &&
+        av_hwdevice_ctx_create(&hw_ctx, device_type, device_path, nullptr, 0) >= 0) {
+      // ok
+    } else if (av_hwdevice_ctx_create(&hw_ctx, device_type, nullptr, nullptr, 0) < 0) {
+      avcodec_free_context(&ctx);
+      return false;
+    }
+    ctx->hw_device_ctx = av_buffer_ref(hw_ctx);
+    if (avcodec_open2(ctx, codec, nullptr) < 0) {
+      avcodec_free_context(&ctx);
+      av_buffer_unref(&hw_ctx);
+      return false;
+    }
+    codec_ctx_ = ctx;
+    hw_device_ctx_ = hw_ctx;
+    RCLCPP_INFO(
+      get_logger(), "Created %s HW device context for %s",
+      av_hwdevice_get_type_name(device_type), name);
+    return true;
+  }
+
+  /// Try to open a decoder without any HW device context.  Works for V4L2
+  /// M2M (which opens /dev/video* directly) and for pure software decode.
+  bool tryOpenSimpleDecoder(const char * name)
+  {
+    const AVCodec * codec = avcodec_find_decoder_by_name(name);
+    if (codec == nullptr) {
+      return false;
+    }
+    AVCodecContext * ctx = makeContext(codec);
+    if (ctx == nullptr) {
+      return false;
+    }
+    if (avcodec_open2(ctx, codec, nullptr) < 0) {
+      avcodec_free_context(&ctx);
+      return false;
+    }
+    codec_ctx_ = ctx;
+    hw_device_ctx_ = nullptr;
+    return true;
+  }
+
+  /// get_format callback — when the decoder offers both a HW pixel format
+  /// and software formats, select the HW one so decoding stays on the GPU.
+  static AVPixelFormat getHwFormat(
+    AVCodecContext * ctx, const AVPixelFormat * pix_fmts)
+  {
+    auto * self = static_cast<H265DecoderNode *>(ctx->opaque);
+    for (const AVPixelFormat * p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+      if (*p == self->hw_pix_fmt_) {
+        return *p;
+      }
+    }
+    return pix_fmts[0];  // fallback to first (software) format
+  }
+
+  /// Open the generic HEVC decoder with hardware acceleration via a HW
+  /// device context.  This is how VA-API decoding works in FFmpeg — there
+  /// is no separate "hevc_vaapi" decoder; the generic "hevc" decoder
+  /// delegates to hardware when a VAAPI (or CUDA/VDPAU) device context is
+  /// provided and a get_format callback selects the HW pixel format.
+  bool tryOpenGenericHwAccel(
+    AVHWDeviceType device_type, const char * device_path = nullptr)
+  {
+    const AVCodec * codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    if (codec == nullptr) {
+      return false;
+    }
+
+    // Check that the generic decoder supports this HW device type.
+    AVPixelFormat target_fmt = AV_PIX_FMT_NONE;
+    for (int i = 0;; ++i) {
+      const AVCodecHWConfig * config = avcodec_get_hw_config(codec, i);
+      if (config == nullptr) {
+        break;
+      }
+      if (config->device_type == device_type &&
+          (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) {
+        target_fmt = config->pix_fmt;
+        break;
+      }
+    }
+    if (target_fmt == AV_PIX_FMT_NONE) {
+      return false;  // FFmpeg build doesn't support this HW type for HEVC
+    }
+
+    // Create the HW device context.
+    AVBufferRef * hw_ctx = nullptr;
+    if (device_path != nullptr &&
+        av_hwdevice_ctx_create(&hw_ctx, device_type, device_path,
+                               nullptr, 0) >= 0) {
+      // ok — explicit render node
+    } else if (av_hwdevice_ctx_create(&hw_ctx, device_type, nullptr,
+                                      nullptr, 0) < 0) {
+      return false;
+    }
+
+    AVCodecContext * ctx = makeContext(codec);
+    if (ctx == nullptr) {
+      av_buffer_unref(&hw_ctx);
+      return false;
+    }
+    ctx->hw_device_ctx = av_buffer_ref(hw_ctx);
+
+    // Wire up the get_format callback so the decoder selects the HW format.
+    hw_pix_fmt_ = target_fmt;
+    ctx->opaque = this;
+    ctx->get_format = getHwFormat;
+
+    if (avcodec_open2(ctx, codec, nullptr) < 0) {
+      avcodec_free_context(&ctx);
+      av_buffer_unref(&hw_ctx);
+      hw_pix_fmt_ = AV_PIX_FMT_NONE;
+      return false;
+    }
+
+    codec_ctx_ = ctx;
+    hw_device_ctx_ = hw_ctx;
+    RCLCPP_INFO(
+      get_logger(), "Opened generic HEVC decoder with %s HW acceleration",
+      av_hwdevice_get_type_name(device_type));
+    return true;
+  }
+
+  /// Open the HEVC decoder.  "auto" tries hardware candidates in order,
+  /// falling back to software.
+  void openDecoder(const std::string & requested)
+  {
+    if (requested != "auto") {
+      // User-specified: try as a simple (no-context) open first.
+      if (tryOpenSimpleDecoder(requested.c_str())) {
+        decoder_label_ = requested;
+        return;
+      }
+      throw std::runtime_error("Failed to open decoder: " + requested);
+    }
+
+    // Auto-detect in priority order.
+    // hevc_v4l2m2m — Jetson NVDEC via V4L2 M2M (no HW device ctx needed)
+    if (tryOpenSimpleDecoder("hevc_v4l2m2m")) {
+      decoder_label_ = "hevc_v4l2m2m/hardware";
+      RCLCPP_INFO(get_logger(), "Auto-selected hardware decoder: hevc_v4l2m2m");
+      return;
+    }
+    // hevc_cuvid — NVIDIA desktop via CUDA (needs CUDA device ctx)
+    if (tryOpenHwDecoder("hevc_cuvid", AV_HWDEVICE_TYPE_CUDA)) {
+      decoder_label_ = "hevc_cuvid/hardware";
+      RCLCPP_INFO(get_logger(), "Auto-selected hardware decoder: hevc_cuvid");
+      return;
+    }
+    // VA-API — Intel / AMD via generic HEVC decoder + HW acceleration.
+    // There is no separate "hevc_vaapi" decoder in FFmpeg; VA-API decoding
+    // uses the generic "hevc" decoder with a VAAPI device context.
+    // In headless / container environments, pass the DRM render node
+    // explicitly since there is no display for auto-detect.
+    if (tryOpenGenericHwAccel(AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128")) {
+      decoder_label_ = "hevc+vaapi/hardware";
+      RCLCPP_INFO(get_logger(), "Auto-selected hardware decoder: hevc + VA-API");
+      return;
+    }
+    // Software fallback — no HW probing (the generic hevc decoder advertises
+    // optional HW configs that can crash when the devices aren't present).
+    const AVCodec * codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    if (codec == nullptr) {
+      throw std::runtime_error("No usable HEVC decoder found");
+    }
+    AVCodecContext * ctx = makeContext(codec);
+    if (ctx == nullptr || avcodec_open2(ctx, codec, nullptr) < 0) {
+      if (ctx != nullptr) {
+        avcodec_free_context(&ctx);
+      }
+      throw std::runtime_error("Failed to open software HEVC decoder");
+    }
+    codec_ctx_ = ctx;
+    hw_device_ctx_ = nullptr;
+    decoder_label_ = "hevc/software";
+    RCLCPP_INFO(get_logger(), "Using software HEVC decoder");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  /// Scan an Annex B byte-stream and return a bitmask:
+  ///   bit 0 — contains VPS/SPS/PPS (NAL types 32-34)
+  ///   bit 1 — contains a keyframe (IDR 19-20, CRA 21, BLA 16-18)
+  enum NalFlags : unsigned {
+    kHasParamSets = 1u << 0,
+    kHasKeyframe  = 1u << 1,
+  };
+
+  static unsigned scanNalTypes(const uint8_t * data, size_t size)
+  {
+    unsigned flags = 0;
     for (size_t i = 0; i + 4 < size; ++i) {
       if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1) {
         const uint8_t nal_type = (data[i + 4] >> 1) & 0x3F;
         if (nal_type >= 32 && nal_type <= 34) {
-          return true;
+          flags |= kHasParamSets;
         }
-        i += 3;  // skip past the start code
+        if (nal_type >= 16 && nal_type <= 21) {
+          flags |= kHasKeyframe;
+        }
+        i += 3;
       }
     }
-    return false;
+    return flags;
   }
 
-  /// Decode a hex string (e.g. "0000000140...") to a byte vector.
+  static bool dataContainsParamSets(const uint8_t * data, size_t size)
+  {
+    return (scanNalTypes(data, size) & kHasParamSets) != 0;
+  }
+
+  /// Compute the mean absolute Laplacian over a subsampled grid.  Measures
+  /// how much edge / texture content the frame has.  Real scenes produce
+  /// values >> 2 (edges, noise); corrupted gradient / all-black frames
+  /// produce ≈ 0 because they are perfectly smooth.
+  static double computeSubsampledSharpness(
+    const uint8_t * data, int width, int height, int stride)
+  {
+    constexpr int kStep = 32;
+    double sum = 0.0;
+    size_t n = 0;
+    for (int y = kStep; y < height - kStep; y += kStep) {
+      const uint8_t * row = data + static_cast<size_t>(y) * stride;
+      const uint8_t * above = data + static_cast<size_t>(y - 1) * stride;
+      const uint8_t * below = data + static_cast<size_t>(y + 1) * stride;
+      for (int x = kStep; x < width - kStep; x += kStep) {
+        // Discrete Laplacian: |4·center − left − right − up − down|
+        const int lap = std::abs(
+          4 * static_cast<int>(row[x]) -
+          static_cast<int>(row[x - 1]) - static_cast<int>(row[x + 1]) -
+          static_cast<int>(above[x]) - static_cast<int>(below[x]));
+        sum += lap;
+        ++n;
+      }
+    }
+    return n > 0 ? sum / static_cast<double>(n) : 0.0;
+  }
+
   static std::vector<uint8_t> hexToBytes(const std::string & hex)
   {
     std::vector<uint8_t> bytes;
     bytes.reserve(hex.size() / 2);
     for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-      bytes.push_back(static_cast<uint8_t>(
-        std::stoul(hex.substr(i, 2), nullptr, 16)));
+      bytes.push_back(
+        static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
     }
     return bytes;
   }
 
-  static GstFlowReturn newSampleCallback(GstAppSink * sink, gpointer user_data)
+  /// If the decoded frame lives in hardware memory (e.g. CUDA, VA-API),
+  /// transfer it to system memory in sw_frame_ and return a pointer to that.
+  /// Otherwise return frame_ as-is.
+  AVFrame * ensureSwFrame()
   {
-    return static_cast<H265DecoderNode *>(user_data)->publishSample(sink);
+    if (frame_->hw_frames_ctx == nullptr) {
+      return frame_;
+    }
+    av_frame_unref(sw_frame_);
+    if (av_hwframe_transfer_data(sw_frame_, frame_, 0) < 0) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Failed to transfer HW frame to system memory");
+      return nullptr;
+    }
+    sw_frame_->pts = frame_->pts;
+    return sw_frame_;
   }
 
-  GstFlowReturn publishSample(GstAppSink * sink)
-  {
-    GstSample * sample = gst_app_sink_pull_sample(sink);
-    if (sample == nullptr) {
-      return GST_FLOW_ERROR;
-    }
-
-    GstCaps * caps = gst_sample_get_caps(sample);
-    GstBuffer * buffer = gst_sample_get_buffer(sample);
-    const GstClockTime pts = buffer != nullptr ? GST_BUFFER_PTS(buffer) : GST_CLOCK_TIME_NONE;
-    int64_t source_stamp_ns = 0;
-    const bool has_source_stamp = takeSourceStamp(pts, source_stamp_ns);
-    GstVideoInfo video_info{};
-    GstMapInfo map{};
-    const bool valid =
-      caps != nullptr && buffer != nullptr &&
-      gst_video_info_from_caps(&video_info, caps) &&
-      gst_buffer_map(buffer, &map, GST_MAP_READ);
-
-    if (!valid) {
-      gst_sample_unref(sample);
-      return GST_FLOW_ERROR;
-    }
-    ++decoded_frame_count_;
-
-    const auto width = GST_VIDEO_INFO_WIDTH(&video_info);
-    const auto height = GST_VIDEO_INFO_HEIGHT(&video_info);
-    const auto stride = static_cast<uint32_t>(GST_VIDEO_INFO_PLANE_STRIDE(&video_info, 0));
-    const auto expected_size = static_cast<size_t>(stride) * height;
-
-    // VOXL2 emits one stale startup frame before the regular 30 Hz timeline.
-    // It is needed to initialize the codec, but must not enter VIO.
-    if (!first_decoded_frame_dropped_) {
-      first_decoded_frame_dropped_ = true;
-      gst_buffer_unmap(buffer, &map);
-      gst_sample_unref(sample);
-      RCLCPP_INFO(get_logger(), "Dropped the H.265 decoder startup frame");
-      return GST_FLOW_OK;
-    }
-
-    sensor_msgs::msg::Image image;
-    if (has_source_stamp) {
-      image.header.stamp = rclcpp::Time(source_stamp_ns);
-    } else if (GST_CLOCK_TIME_IS_VALID(pts)) {
-      if (!output_time_anchored_) {
-        output_anchor_ros_ns_ = now().nanoseconds();
-        output_anchor_pts_ = pts;
-        output_time_anchored_ = true;
-        RCLCPP_INFO(
-          get_logger(),
-          "Anchored decoded camera time at ROS %.9f (source PTS %.9f)",
-          static_cast<double>(output_anchor_ros_ns_) / 1.0e9,
-          static_cast<double>(output_anchor_pts_) / GST_SECOND);
-      }
-
-      if (pts >= output_anchor_pts_) {
-        const auto stamp_ns = output_anchor_ros_ns_ +
-          static_cast<int64_t>(pts - output_anchor_pts_);
-        image.header.stamp = rclcpp::Time(stamp_ns);
-      } else {
-        RCLCPP_WARN_ONCE(
-          get_logger(), "Decoded H.265 PTS moved backwards; using current ROS time");
-        image.header.stamp = now();
-      }
-    } else {
-      RCLCPP_WARN_ONCE(
-        get_logger(), "Decoded H.265 frame has no valid PTS; using current ROS time");
-      image.header.stamp = now();
-    }
-    image.header.frame_id = frame_id_;
-    image.height = height;
-    image.width = width;
-    image.encoding = output_encoding_;
-    image.is_bigendian = false;
-    image.step = stride;
-    image.data.resize(expected_size);
-    std::memcpy(image.data.data(), map.data, std::min(expected_size, map.size));
-
-    gst_buffer_unmap(buffer, &map);
-    gst_sample_unref(sample);
-    decoded_pub_->publish(std::move(image));
-    ++published_frame_count_;
-    return GST_FLOW_OK;
-  }
+  // ---------------------------------------------------------------------------
+  // Decode + publish
+  // ---------------------------------------------------------------------------
 
   void encodedCallback(const sensor_msgs::msg::CompressedImage::ConstSharedPtr msg)
   {
-    ++received_packet_count_;
+    ++received_count_;
     if (msg->data.empty()) {
       return;
     }
@@ -308,187 +456,218 @@ private:
         get_logger(), "Expected h265/hevc but input format is '%s'", msg->format.c_str());
     }
 
-    GstBuffer * buffer = gst_buffer_new_allocate(nullptr, msg->data.size(), nullptr);
-    if (buffer == nullptr) {
-      RCLCPP_ERROR(get_logger(), "Failed to allocate an H.265 input buffer");
+    const uint8_t * payload = msg->data.data();
+    size_t payload_size = msg->data.size();
+    std::vector<uint8_t> augmented;  // only allocated when we prepend params
+
+    // First packet: inject fallback codec params if the stream is missing them.
+    if (packet_count_ == 0 && !fallback_codec_params_.empty() &&
+        !dataContainsParamSets(payload, payload_size)) {
+      augmented.reserve(fallback_codec_params_.size() + payload_size);
+      augmented.insert(augmented.end(),
+        fallback_codec_params_.begin(), fallback_codec_params_.end());
+      augmented.insert(augmented.end(), payload, payload + payload_size);
+      payload = augmented.data();
+      payload_size = augmented.size();
+      RCLCPP_WARN(
+        get_logger(),
+        "Stream missing VPS/SPS/PPS — prepended %zu-byte fallback codec params",
+        fallback_codec_params_.size());
+    }
+    ++packet_count_;
+
+    const unsigned nal_flags = scanNalTypes(payload, payload_size);
+    const bool is_bootstrap = packet_count_ == 1;
+
+    // Flush the DPB at every keyframe so each GOP starts clean and P-frames
+    // never decode against a stale reference from the previous GOP.
+    if (!is_bootstrap && (nal_flags & kHasKeyframe)) {
+      avcodec_flush_buffers(codec_ctx_);
+    }
+
+    pkt_->data = const_cast<uint8_t *>(payload);
+    pkt_->size = static_cast<int>(payload_size);
+    int ret = avcodec_send_packet(codec_ctx_, pkt_);
+    if (ret < 0) {
+      ++error_count_;
+      RCLCPP_DEBUG_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "avcodec_send_packet failed (%d)", ret);
       return;
     }
-    gst_buffer_fill(buffer, 0, msg->data.data(), msg->data.size());
 
-    constexpr uint64_t nominal_frame_ns = GST_SECOND / 30;
-    const bool stamp_has_seconds = msg->header.stamp.sec > 0;
-    const uint64_t full_stamp_ns = stamp_has_seconds ?
-      static_cast<uint64_t>(msg->header.stamp.sec) * GST_SECOND +
-      msg->header.stamp.nanosec : 0;
-    const uint32_t truncated_stamp = msg->header.stamp.nanosec;
+    while ((ret = avcodec_receive_frame(codec_ctx_, frame_)) == 0) {
+      ++decoded_count_;
 
-    // If the first packet is missing VPS/SPS/PPS (bag recorded after another
-    // subscriber consumed the encoder's initial parameter packets), inject
-    // the fallback codec parameters as a synthetic bootstrap before
-    // processing the current packet normally.
-    if (source_packet_count_ == 0 && !fallback_codec_params_.empty() &&
-        !dataContainsParamSets(msg->data.data(), msg->data.size())) {
-      GstBuffer * param_buf = gst_buffer_new_allocate(
-        nullptr, fallback_codec_params_.size(), nullptr);
-      if (param_buf != nullptr) {
-        gst_buffer_fill(param_buf, 0, fallback_codec_params_.data(),
-          fallback_codec_params_.size());
-        GST_BUFFER_PTS(param_buf) = 0;
-        GST_BUFFER_DTS(param_buf) = 0;
-        GST_BUFFER_DURATION(param_buf) = 0;
-        const auto status = gst_app_src_push_buffer(
-          GST_APP_SRC(appsrc_), param_buf);
-        if (status == GST_FLOW_OK) {
-          ++pushed_packet_count_;
+      // Transfer from GPU memory if needed (hevc_cuvid, hevc_vaapi).
+      AVFrame * out = ensureSwFrame();
+      if (out == nullptr) {
+        av_frame_unref(frame_);
+        continue;
+      }
+
+      if (is_bootstrap) {
+        RCLCPP_INFO(
+          get_logger(), "Dropped H.265 bootstrap frame (%dx%d, %s)",
+          out->width, out->height,
+          av_get_pix_fmt_name(static_cast<AVPixelFormat>(out->format)));
+        av_frame_unref(frame_);
+        continue;
+      }
+
+      // --- Corruption detection ---
+      bool corrupt = (out->flags & AV_FRAME_FLAG_CORRUPT) != 0;
+      if (!corrupt && out->decode_error_flags != 0) {
+        corrupt = true;
+      }
+      // Layer 3: Laplacian sharpness — catches gradient / all-black frames
+      //          that decode "successfully" but contain no real scene content.
+      if (!corrupt && min_frame_sharpness_ > 0.0 && out->data[0] != nullptr) {
+        const double sharpness = computeSubsampledSharpness(
+          out->data[0], out->width, out->height, out->linesize[0]);
+        if (sharpness < min_frame_sharpness_) {
+          corrupt = true;
+          RCLCPP_DEBUG(
+            get_logger(),
+            "Frame sharpness %.2f below threshold %.2f — treating as corrupt",
+            sharpness, min_frame_sharpness_);
         }
-        ++source_packet_count_;
-        input_pts_ns_ = 0;
-        RCLCPP_WARN(get_logger(),
-          "Stream missing VPS/SPS/PPS — injected %zu-byte fallback codec parameters",
-          fallback_codec_params_.size());
       }
-      // Fall through: source_packet_count_ is now 1, so this packet
-      // enters the re-anchor branch below.
-    }
-
-    if (source_packet_count_ == 0) {
-      // The first VOXL2 packet is a codec bootstrap packet. Give it PTS zero;
-      // its decoded frame is deliberately discarded below.
-      input_pts_ns_ = 0;
-    } else if (source_packet_count_ == 1) {
-      // Re-anchor on the first regular frame. It must have a distinct PTS for
-      // nvv4l2decoder, even when the bootstrap timestamp is discontinuous.
-      input_pts_ns_ = nominal_frame_ns;
-      RCLCPP_INFO(
-        get_logger(), "Anchored regular H.265 stream after bootstrap packet");
-    } else {
-      int64_t delta_ns;
-      if (stamp_has_seconds != previous_stamp_has_seconds_) {
-        RCLCPP_WARN(
-          get_logger(), "Encoded timestamp representation changed; using one nominal interval");
-        delta_ns = nominal_frame_ns;
-      } else if (stamp_has_seconds) {
-        delta_ns = static_cast<int64_t>(full_stamp_ns) -
-          static_cast<int64_t>(previous_full_stamp_ns_);
-      } else {
-        // Interpret subtraction modulo 2^32 as a signed delta. At 30 Hz this
-        // handles every 4.295-second wrap without changing frame timing.
-        const uint32_t raw_delta = truncated_stamp - previous_truncated_stamp_;
-        delta_ns = raw_delta <= 0x7fffffffU ?
-          static_cast<int64_t>(raw_delta) :
-          static_cast<int64_t>(raw_delta) - (1LL << 32);
-      }
-
-      if (delta_ns <= 0) {
-        ++dropped_packet_count_;
+      if (corrupt) {
+        ++corrupt_count_;
         RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "Dropping duplicate/out-of-order H.265 packet (delta %.3f ms)",
-          static_cast<double>(delta_ns) / 1.0e6);
-        gst_buffer_unref(buffer);
-        return;
+          get_logger(), *get_clock(), 1000,
+          "Skipping corrupt H.265 frame (total: %" PRIu64 ")",
+          corrupt_count_.load());
+        av_frame_unref(frame_);
+        continue;
       }
-      input_pts_ns_ += static_cast<uint64_t>(delta_ns);
+
+      publishFrame(out, msg->header.stamp);
+      ++published_count_;
+      av_frame_unref(frame_);
     }
 
-    previous_stamp_has_seconds_ = stamp_has_seconds;
-    previous_full_stamp_ns_ = full_stamp_ns;
-    previous_truncated_stamp_ = truncated_stamp;
-    ++source_packet_count_;
-    GST_BUFFER_PTS(buffer) = input_pts_ns_;
-    GST_BUFFER_DTS(buffer) = GST_BUFFER_PTS(buffer);
-    GST_BUFFER_DURATION(buffer) = nominal_frame_ns;
-
-    if (stamp_has_seconds) {
-      std::lock_guard<std::mutex> lock(source_stamps_mutex_);
-      source_stamps_[input_pts_ns_] = static_cast<int64_t>(full_stamp_ns);
-      constexpr size_t max_pending_source_stamps = 512;
-      while (source_stamps_.size() > max_pending_source_stamps) {
-        source_stamps_.erase(source_stamps_.begin());
-      }
-    }
-
-    const auto status = gst_app_src_push_buffer(GST_APP_SRC(appsrc_), buffer);
-    if (status != GST_FLOW_OK) {
-      RCLCPP_WARN_THROTTLE(
+    if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF) {
+      RCLCPP_DEBUG_THROTTLE(
         get_logger(), *get_clock(), 2000,
-        "GStreamer rejected an H.265 packet (status %d)", status);
-    } else {
-      ++pushed_packet_count_;
+        "avcodec_receive_frame returned %d", ret);
     }
   }
 
-  bool takeSourceStamp(GstClockTime pts, int64_t & stamp_ns)
+  void publishFrame(
+    const AVFrame * out, const builtin_interfaces::msg::Time & source_stamp)
   {
-    if (!GST_CLOCK_TIME_IS_VALID(pts)) {
-      return false;
-    }
+    sensor_msgs::msg::Image image;
+    image.header.stamp = source_stamp;
+    image.header.frame_id = frame_id_;
+    image.width = static_cast<uint32_t>(out->width);
+    image.height = static_cast<uint32_t>(out->height);
+    image.encoding = output_encoding_;
+    image.is_bigendian = false;
 
-    std::lock_guard<std::mutex> lock(source_stamps_mutex_);
-    const auto match = source_stamps_.find(pts);
-    if (match == source_stamps_.end()) {
-      return false;
-    }
-    stamp_ns = match->second;
-    source_stamps_.erase(match);
-    return true;
-  }
+    const int w = out->width;
+    const int h = out->height;
 
-  void pollBus()
-  {
-    RCLCPP_INFO_THROTTLE(
-      get_logger(), *get_clock(), 5000,
-      "H.265 totals: received=%" PRIu64 ", pushed=%" PRIu64
-      ", decoded=%" PRIu64 ", published=%" PRIu64 ", input_dropped=%" PRIu64,
-      received_packet_count_.load(), pushed_packet_count_.load(),
-      decoded_frame_count_.load(), published_frame_count_.load(),
-      dropped_packet_count_.load());
-
-    GstBus * bus = gst_element_get_bus(pipeline_);
-    while (GstMessage * message = gst_bus_pop_filtered(
-        bus, static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_WARNING)))
-    {
-      GError * error = nullptr;
-      gchar * details = nullptr;
-      if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR) {
-        gst_message_parse_error(message, &error, &details);
-        RCLCPP_ERROR(get_logger(), "GStreamer: %s", error->message);
+    if (output_mono_) {
+      // The Y (luma) plane IS the grayscale image — no conversion.
+      image.step = static_cast<uint32_t>(w);
+      image.data.resize(static_cast<size_t>(w) * h);
+      const uint8_t * src = out->data[0];
+      const int src_stride = out->linesize[0];
+      if (src_stride == w) {
+        std::memcpy(image.data.data(), src, image.data.size());
       } else {
-        gst_message_parse_warning(message, &error, &details);
-        RCLCPP_WARN(get_logger(), "GStreamer: %s", error->message);
+        for (int y = 0; y < h; ++y) {
+          std::memcpy(
+            image.data.data() + static_cast<size_t>(y) * w,
+            src + static_cast<size_t>(y) * src_stride,
+            w);
+        }
       }
-      g_clear_error(&error);
-      g_free(details);
-      gst_message_unref(message);
+    } else {
+      // BGR conversion via swscale (lazy-initialised on first frame).
+      const auto src_fmt = static_cast<AVPixelFormat>(out->format);
+      if (sws_ctx_ == nullptr || sws_src_fmt_ != src_fmt ||
+          sws_w_ != w || sws_h_ != h) {
+        if (sws_ctx_ != nullptr) {
+          sws_freeContext(sws_ctx_);
+        }
+        sws_ctx_ = sws_getContext(
+          w, h, src_fmt, w, h, AV_PIX_FMT_BGR24,
+          SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+        if (sws_ctx_ == nullptr) {
+          RCLCPP_ERROR(get_logger(), "Failed to create swscale context");
+          return;
+        }
+        sws_src_fmt_ = src_fmt;
+        sws_w_ = w;
+        sws_h_ = h;
+      }
+      const int dst_stride = w * 3;
+      image.step = static_cast<uint32_t>(dst_stride);
+      image.data.resize(static_cast<size_t>(dst_stride) * h);
+      uint8_t * dst_data[1] = {image.data.data()};
+      int dst_linesize[1] = {dst_stride};
+      sws_scale(
+        sws_ctx_, out->data, out->linesize, 0, h, dst_data, dst_linesize);
     }
-    gst_object_unref(bus);
+
+    decoded_pub_->publish(std::move(image));
   }
 
-  GstElement * pipeline_{nullptr};
-  GstElement * appsrc_{nullptr};
-  GstElement * appsink_{nullptr};
+  void logStats()
+  {
+    // Plain RCLCPP_INFO — the wall timer already fires every 5 s, and
+    // RCLCPP_INFO_THROTTLE uses the ROS clock which may not advance
+    // during bag playback without use_sim_time.
+    RCLCPP_INFO(
+      get_logger(),
+      "H.265 [%s]: received=%" PRIu64 " decoded=%" PRIu64
+      " published=%" PRIu64 " corrupt=%" PRIu64
+      " errors=%" PRIu64,
+      decoder_label_.c_str(),
+      received_count_.load(), decoded_count_.load(),
+      published_count_.load(), corrupt_count_.load(),
+      error_count_.load());
+  }
+
+  // ---------------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------------
+
+  // FFmpeg
+  AVCodecContext * codec_ctx_{nullptr};
+  AVBufferRef * hw_device_ctx_{nullptr};
+  AVPixelFormat hw_pix_fmt_{AV_PIX_FMT_NONE};  // HW surface format for get_format
+  AVFrame * frame_{nullptr};     // raw decode output (may be HW surface)
+  AVFrame * sw_frame_{nullptr};  // CPU-side frame after HW transfer
+  AVPacket * pkt_{nullptr};
+  SwsContext * sws_ctx_{nullptr};
+  AVPixelFormat sws_src_fmt_{AV_PIX_FMT_NONE};
+  int sws_w_{0};
+  int sws_h_{0};
+
+  // ROS
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr encoded_sub_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr decoded_pub_;
-  rclcpp::TimerBase::SharedPtr bus_timer_;
+  rclcpp::TimerBase::SharedPtr stats_timer_;
+
+  // Config
   std::string frame_id_;
   std::string output_encoding_;
+  std::string decoder_label_;
+  bool output_mono_{false};
+  double min_frame_sharpness_{0.0};
   std::vector<uint8_t> fallback_codec_params_;
-  bool previous_stamp_has_seconds_{false};
-  uint64_t previous_full_stamp_ns_{0};
-  uint32_t previous_truncated_stamp_{0};
-  uint64_t input_pts_ns_{0};
-  uint64_t source_packet_count_{0};
-  std::atomic<uint64_t> received_packet_count_{0};
-  std::atomic<uint64_t> pushed_packet_count_{0};
-  std::atomic<uint64_t> dropped_packet_count_{0};
-  std::atomic<uint64_t> decoded_frame_count_{0};
-  std::atomic<uint64_t> published_frame_count_{0};
-  bool first_decoded_frame_dropped_{false};
-  bool output_time_anchored_{false};
-  GstClockTime output_anchor_pts_{GST_CLOCK_TIME_NONE};
-  int64_t output_anchor_ros_ns_{0};
-  std::mutex source_stamps_mutex_;
-  std::map<GstClockTime, int64_t> source_stamps_;
+
+  // Counters
+  uint64_t packet_count_{0};
+  std::atomic<uint64_t> received_count_{0};
+  std::atomic<uint64_t> decoded_count_{0};
+  std::atomic<uint64_t> published_count_{0};
+  std::atomic<uint64_t> corrupt_count_{0};
+  std::atomic<uint64_t> error_count_{0};
 };
 
 int main(int argc, char ** argv)

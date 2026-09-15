@@ -9,10 +9,10 @@ find_package(ament_cmake REQUIRED)
 find_package(PkgConfig REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
-pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET
-  gstreamer-1.0
-  gstreamer-app-1.0
-  gstreamer-video-1.0
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+  libavcodec
+  libavutil
+  libswscale
 )
 
 add_executable(h265_decoder_node src/h265_decoder_node.cpp)
@@ -22,7 +22,7 @@ ament_target_dependencies(
   rclcpp
   sensor_msgs
 )
-target_link_libraries(h265_decoder_node PkgConfig::GSTREAMER)
+target_link_libraries(h265_decoder_node PkgConfig::FFMPEG)
 
 install(TARGETS h265_decoder_node
   DESTINATION lib/${PROJECT_NAME}
